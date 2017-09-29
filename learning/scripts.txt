@@ -1,0 +1,4620 @@
+---------------------------------------------------------------------
+-- Code to create and populate Performance sample database
+-- © Itzik Ben-Gan
+---------------------------------------------------------------------
+
+-- Creation Script for Sample Database and Tables
+SET NOCOUNT ON;
+USE master;
+IF DB_ID('Performance') IS NULL CREATE DATABASE Performance;
+GO
+USE Performance;
+GO
+
+-- drop objects if exist
+IF OBJECT_ID('dbo.GetNums', 'IF') IS NOT NULL DROP FUNCTION dbo.GetNums;
+
+IF OBJECT_ID('dbo.VEmpOrders') IS NOT NULL DROP VIEW dbo.VEmpOrders;
+
+IF OBJECT_ID('dbo.Orders') IS NOT NULL DROP TABLE dbo.Orders;
+IF OBJECT_ID('dbo.Customers') IS NOT NULL DROP TABLE dbo.Customers;
+IF OBJECT_ID('dbo.Employees') IS NOT NULL DROP TABLE dbo.Employees;
+IF OBJECT_ID('dbo.Shippers') IS NOT NULL DROP TABLE dbo.Shippers;
+
+IF OBJECT_ID('dbo.Fact', 'U') IS NOT NULL DROP TABLE dbo.Fact;
+IF OBJECT_ID('dbo.Dim1', 'U') IS NOT NULL DROP TABLE dbo.Dim1;
+IF OBJECT_ID('dbo.Dim2', 'U') IS NOT NULL DROP TABLE dbo.Dim2;
+IF OBJECT_ID('dbo.Dim3', 'U') IS NOT NULL DROP TABLE dbo.Dim3;
+GO
+
+-- definition of GetNums function
+CREATE FUNCTION dbo.GetNums(@low AS BIGINT, @high AS BIGINT) RETURNS TABLE
+AS
+RETURN
+  WITH
+    L0   AS (SELECT c FROM (VALUES(1),(1)) AS D(c)),
+    L1   AS (SELECT 1 AS c FROM L0 AS A CROSS JOIN L0 AS B),
+    L2   AS (SELECT 1 AS c FROM L1 AS A CROSS JOIN L1 AS B),
+    L3   AS (SELECT 1 AS c FROM L2 AS A CROSS JOIN L2 AS B),
+    L4   AS (SELECT 1 AS c FROM L3 AS A CROSS JOIN L3 AS B),
+    L5   AS (SELECT 1 AS c FROM L4 AS A CROSS JOIN L4 AS B),
+    Nums AS (SELECT ROW_NUMBER() OVER(ORDER BY (SELECT NULL)) AS rownum
+            FROM L5)
+  SELECT TOP(@high - @low + 1) @low + rownum - 1 AS n
+  FROM Nums
+  ORDER BY rownum;
+GO
+
+-- data distribution settings for orders
+DECLARE
+  @numorders   AS INT      =   1000000,
+  @numcusts    AS INT      =     20000,
+  @numemps     AS INT      =       500,
+  @numshippers AS INT      =         5,
+  @numyears    AS INT      =         4,
+  @startdate   AS DATETIME = '20050101';
+
+-- Creating and Populating the Customers Table
+CREATE TABLE dbo.Customers
+(
+  custid   CHAR(11)     NOT NULL,
+  custname NVARCHAR(50) NOT NULL
+);
+
+INSERT INTO dbo.Customers(custid, custname)
+  SELECT
+    'C' + RIGHT('000000000' + CAST(n AS VARCHAR(10)), 10) AS custid,
+    N'Cust_' + CAST(n AS VARCHAR(10)) AS custname
+  FROM dbo.GetNums(1, @numcusts);
+
+ALTER TABLE dbo.Customers ADD
+  CONSTRAINT PK_Customers PRIMARY KEY(custid);
+
+-- Creating and Populating the Employees Table
+CREATE TABLE dbo.Employees
+(
+  empid     INT          NOT NULL,
+  firstname NVARCHAR(25) NOT NULL,
+  lastname  NVARCHAR(25) NOT NULL
+);
+
+INSERT INTO dbo.Employees(empid, firstname, lastname)
+  SELECT n AS empid,
+    N'Fname_' + CAST(n AS NVARCHAR(10)) AS firstname,
+    N'Lname_' + CAST(n AS NVARCHAR(10)) AS lastname
+  FROM dbo.GetNums(1, @numemps);
+
+ALTER TABLE dbo.Employees ADD
+  CONSTRAINT PK_Employees PRIMARY KEY(empid);
+
+-- Creating and Populating the Shippers Table
+CREATE TABLE dbo.Shippers
+(
+  shipperid   VARCHAR(5)   NOT NULL,
+  shippername NVARCHAR(50) NOT NULL
+);
+
+INSERT INTO dbo.Shippers(shipperid, shippername)
+  SELECT shipperid, N'Shipper_' + shipperid AS shippername
+  FROM (SELECT CHAR(ASCII('A') - 2 + 2 * n) AS shipperid
+        FROM dbo.GetNums(1, @numshippers)) AS D;
+
+ALTER TABLE dbo.Shippers ADD
+  CONSTRAINT PK_Shippers PRIMARY KEY(shipperid);
+
+-- Creating and Populating the Orders Table
+CREATE TABLE dbo.Orders
+(
+  orderid   INT        NOT NULL,
+  custid    CHAR(11)   NOT NULL,
+  empid     INT        NOT NULL,
+  shipperid VARCHAR(5) NOT NULL,
+  orderdate DATETIME   NOT NULL,
+  filler    CHAR(155)  NOT NULL DEFAULT('a')
+);
+
+INSERT INTO dbo.Orders(orderid, custid, empid, shipperid, orderdate)
+  SELECT n AS orderid,
+    'C' + RIGHT('000000000'
+            + CAST(
+                1 + ABS(CHECKSUM(NEWID())) % @numcusts
+                AS VARCHAR(10)), 10) AS custid,
+    1 + ABS(CHECKSUM(NEWID())) % @numemps AS empid,
+    CHAR(ASCII('A') - 2
+           + 2 * (1 + ABS(CHECKSUM(NEWID())) % @numshippers)) AS shipperid,
+      DATEADD(day, n / (@numorders / (@numyears * 365.25)), @startdate)
+        -- late arrival with earlier date
+        - CASE WHEN n % 10 = 0
+            THEN 1 + ABS(CHECKSUM(NEWID())) % 30
+            ELSE 0 
+          END AS orderdate
+  FROM dbo.GetNums(1, @numorders)
+  ORDER BY CHECKSUM(NEWID());
+
+CREATE CLUSTERED INDEX idx_cl_od ON dbo.Orders(orderdate);
+
+CREATE NONCLUSTERED INDEX idx_nc_sid_od_cid
+  ON dbo.Orders(shipperid, orderdate, custid);
+
+CREATE UNIQUE INDEX idx_unc_od_oid_i_cid_eid
+  ON dbo.Orders(orderdate, orderid)
+  INCLUDE(custid, empid);
+
+ALTER TABLE dbo.Orders ADD
+  CONSTRAINT PK_Orders PRIMARY KEY NONCLUSTERED(orderid),
+  CONSTRAINT FK_Orders_Customers
+    FOREIGN KEY(custid)    REFERENCES dbo.Customers(custid),
+  CONSTRAINT FK_Orders_Employees
+    FOREIGN KEY(empid)     REFERENCES dbo.Employees(empid),
+  CONSTRAINT FK_Orders_Shippers
+    FOREIGN KEY(shipperid) REFERENCES dbo.Shippers(shipperid);
+GO
+
+-- data distribution settings for dw
+DECLARE
+  @dim1rows AS INT = 100,
+  @dim2rows AS INT = 50,
+  @dim3rows AS INT = 200;
+
+CREATE TABLE dbo.Dim1
+(
+  key1  INT NOT NULL CONSTRAINT PK_Dim1 PRIMARY KEY,
+  attr1 INT NOT NULL,
+  filler BINARY(100) NOT NULL DEFAULT (0x)
+);
+
+CREATE TABLE dbo.Dim2
+(
+  key2  INT NOT NULL CONSTRAINT PK_Dim2 PRIMARY KEY,
+  attr1 INT NOT NULL,
+  filler BINARY(100) NOT NULL DEFAULT (0x)
+);
+
+CREATE TABLE dbo.Dim3
+(
+  key3  INT NOT NULL CONSTRAINT PK_Dim3 PRIMARY KEY,
+  attr1 INT NOT NULL,
+  filler BINARY(100) NOT NULL DEFAULT (0x)
+);
+
+CREATE TABLE dbo.Fact
+(
+  key1 INT NOT NULL CONSTRAINT FK_Fact_Dim1 FOREIGN KEY REFERENCES dbo.Dim1,
+  key2 INT NOT NULL CONSTRAINT FK_Fact_Dim2 FOREIGN KEY REFERENCES dbo.Dim2,
+  key3 INT NOT NULL CONSTRAINT FK_Fact_Dim3 FOREIGN KEY REFERENCES dbo.Dim3,
+  measure1 INT NOT NULL,
+  measure2 INT NOT NULL,
+  measure3 INT NOT NULL,
+  filler  BINARY(100) NOT NULL DEFAULT (0x),
+  CONSTRAINT PK_Fact PRIMARY KEY(key1, key2, key3)
+);
+
+INSERT INTO dbo.Dim1(key1, attr1)
+  SELECT n, ABS(CHECKSUM(NEWID())) % 20 + 1
+  FROM dbo.GetNums(1, @dim1rows);
+
+INSERT INTO dbo.Dim2(key2, attr1)
+  SELECT n, ABS(CHECKSUM(NEWID())) % 10 + 1
+  FROM dbo.GetNums(1, @dim2rows);
+
+INSERT INTO dbo.Dim3(key3, attr1)
+  SELECT n, ABS(CHECKSUM(NEWID())) % 40 + 1
+  FROM dbo.GetNums(1, @dim3rows);
+
+INSERT INTO dbo.Fact WITH (TABLOCK) 
+    (key1, key2, key3, measure1, measure2, measure3)
+  SELECT N1.n, N2.n, N3.n,
+    ABS(CHECKSUM(NEWID())) % 1000000 + 1,
+    ABS(CHECKSUM(NEWID())) % 1000000 + 1,
+    ABS(CHECKSUM(NEWID())) % 1000000 + 1
+  FROM dbo.GetNums(1, @dim1rows) AS N1
+    CROSS JOIN dbo.GetNums(1, @dim2rows) AS N2
+    CROSS JOIN dbo.GetNums(1, @dim3rows) AS N3;
+GO
+
+---------------------------------------------------------------------
+-- Mastering T-SQL Querying Fundamentals
+-- © Itzik Ben-Gan, SolidQ
+-- Advanced T-SQL training: http://tsql.solidq.com
+---------------------------------------------------------------------
+
+USE TSQLV4; -- http://tsql.solidq.com/SampleDatabases/TSQLV4.zip
+
+---------------------------------------------------------------------
+-- Logical Query Processing
+---------------------------------------------------------------------
+
+---------------------------------------------------------------------
+-- Logical Query Processing Example
+---------------------------------------------------------------------
+
+-- Create and populate tables dbo.Customers and dbo.Orders
+SET NOCOUNT ON;
+USE tempdb;
+
+IF OBJECT_ID(N'dbo.Orders', N'U') IS NOT NULL
+  DROP TABLE dbo.Orders;
+
+IF OBJECT_ID(N'dbo.Customers', N'U') IS NOT NULL
+  DROP TABLE dbo.Customers;
+
+CREATE TABLE dbo.Customers
+(
+  custid  CHAR(5)     NOT NULL,
+  city    VARCHAR(10) NOT NULL,
+  CONSTRAINT PK_Customers PRIMARY KEY(custid)
+);
+
+CREATE TABLE dbo.Orders
+(
+  orderid INT     NOT NULL,
+  custid  CHAR(5) NULL,
+  CONSTRAINT PK_Orders PRIMARY KEY(orderid),
+  CONSTRAINT PK_Orders_Customers FOREIGN KEY(custid)
+    REFERENCES dbo.Customers(custid)
+);
+GO
+
+INSERT INTO dbo.Customers(custid, city) VALUES('FISSA', 'Madrid');
+INSERT INTO dbo.Customers(custid, city) VALUES('FRNDO', 'Madrid');
+INSERT INTO dbo.Customers(custid, city) VALUES('KRLOS', 'Madrid');
+INSERT INTO dbo.Customers(custid, city) VALUES('MRPHS', 'Zion');
+
+INSERT INTO dbo.Orders(orderid, custid) VALUES(1, 'FRNDO');
+INSERT INTO dbo.Orders(orderid, custid) VALUES(2, 'FRNDO');
+INSERT INTO dbo.Orders(orderid, custid) VALUES(3, 'KRLOS');
+INSERT INTO dbo.Orders(orderid, custid) VALUES(4, 'KRLOS');
+INSERT INTO dbo.Orders(orderid, custid) VALUES(5, 'KRLOS');
+INSERT INTO dbo.Orders(orderid, custid) VALUES(6, 'MRPHS');
+INSERT INTO dbo.Orders(orderid, custid) VALUES(7, NULL);
+
+-- Return the customer ID and number of orders for customers
+-- from Madrid who placed fewer than 3 orders.
+-- Sort the result by the number of orders.
+
+SELECT C.custid, COUNT(O.orderid) AS numorders
+FROM dbo.Customers AS C
+  LEFT OUTER JOIN dbo.Orders AS O
+    ON C.custid = O.custid
+WHERE C.city = 'Madrid'
+GROUP BY C.custid
+HAVING COUNT(O.orderid) < 3
+ORDER BY numorders;
+
+-- Multi-row assignment with a variable
+SET NOCOUNT ON;
+USE tempdb;
+GO
+
+-- Create a table called T1 and populate it with sample data
+IF OBJECT_ID('dbo.T1', 'U') IS NOT NULL DROP TABLE dbo.T1;
+
+CREATE TABLE dbo.T1
+(
+  col1   INT IDENTITY NOT NULL,
+  col2   VARCHAR(100) NOT NULL,
+  filler CHAR(2000) NULL,
+  CONSTRAINT PK_T1 PRIMARY KEY CLUSTERED(col1)
+);
+
+INSERT INTO dbo.T1(col2)
+  SELECT 'String ' + CAST(n AS VARCHAR(10))
+  FROM TSQL2012.dbo.GetNums(1, 100) AS Nums;
+GO
+
+-- Test 1, with ORDER BY
+DECLARE @s AS VARCHAR(MAX);
+SET @s = '';
+
+SELECT @s = @s + col2 + ';'
+FROM dbo.T1
+ORDER BY col1;
+
+SELECT @s;
+GO
+
+-- Test 2, with ORDER BY, after adding covering nc index
+CREATE NONCLUSTERED INDEX idx_nc_col2 ON dbo.T1(col2, col1);
+GO
+
+DECLARE @s AS VARCHAR(MAX);
+SET @s = '';
+
+SELECT @s = @s + col2 + ';'
+FROM dbo.T1
+ORDER BY col1;
+
+SELECT @s;
+GO
+
+---------------------------------------------------------------------
+-- CROSS Joins
+---------------------------------------------------------------------
+
+-- SQL-92
+USE TSQLV4;
+
+SELECT C.custid, E.empid
+FROM Sales.Customers AS C
+  CROSS JOIN HR.Employees AS E;
+
+-- SQL-89
+SELECT C.custid, E.empid
+FROM Sales.Customers AS C, HR.Employees AS E;
+
+-- Self Cross-Join
+SELECT
+  E1.empid, E1.firstname, E1.lastname,
+  E2.empid, E2.firstname, E2.lastname
+FROM HR.Employees AS E1 
+  CROSS JOIN HR.Employees AS E2;
+GO
+
+-- All numbers from 1 - 1000
+
+-- Auxiliary table of digits
+USE TSQLV4;
+
+DROP TABLE IF EXISTS dbo.Digits;
+
+CREATE TABLE dbo.Digits(digit INT NOT NULL PRIMARY KEY);
+
+INSERT INTO dbo.Digits(digit)
+  VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9);
+
+SELECT digit FROM dbo.Digits;
+GO
+
+-- All numbers from 1 - 1000
+SELECT D3.digit * 100 + D2.digit * 10 + D1.digit + 1 AS n
+FROM         dbo.Digits AS D1
+  CROSS JOIN dbo.Digits AS D2
+  CROSS JOIN dbo.Digits AS D3
+ORDER BY n;
+
+---------------------------------------------------------------------
+-- INNER Joins
+---------------------------------------------------------------------
+
+-- SQL-92
+USE TSQLV4;
+
+SELECT E.empid, E.firstname, E.lastname, O.orderid
+FROM HR.Employees AS E
+  INNER JOIN Sales.Orders AS O
+    ON E.empid = O.empid;
+
+-- SQL-89
+SELECT E.empid, E.firstname, E.lastname, O.orderid
+FROM HR.Employees AS E, Sales.Orders AS O
+WHERE E.empid = O.empid;
+GO
+
+-- Inner Join Safety
+/*
+SELECT E.empid, E.firstname, E.lastname, O.orderid
+FROM HR.Employees AS E
+  INNER JOIN Sales.Orders AS O;
+GO
+*/
+
+SELECT E.empid, E.firstname, E.lastname, O.orderid
+FROM HR.Employees AS E, Sales.Orders AS O;
+GO
+
+---------------------------------------------------------------------
+-- More Join Examples
+---------------------------------------------------------------------
+
+---------------------------------------------------------------------
+-- Composite Joins
+---------------------------------------------------------------------
+
+-- Audit table for updates against OrderDetails
+USE TSQLV4;
+
+DROP TABLE IF EXISTS Sales.OrderDetailsAudit;
+
+CREATE TABLE Sales.OrderDetailsAudit
+(
+  lsn        INT NOT NULL IDENTITY,
+  orderid    INT NOT NULL,
+  productid  INT NOT NULL,
+  dt         DATETIME NOT NULL,
+  loginname  sysname NOT NULL,
+  columnname sysname NOT NULL,
+  oldval     SQL_VARIANT,
+  newval     SQL_VARIANT,
+  CONSTRAINT PK_OrderDetailsAudit PRIMARY KEY(lsn),
+  CONSTRAINT FK_OrderDetailsAudit_OrderDetails
+    FOREIGN KEY(orderid, productid)
+    REFERENCES Sales.OrderDetails(orderid, productid)
+);
+
+SELECT OD.orderid, OD.productid, OD.qty,
+  ODA.dt, ODA.loginname, ODA.oldval, ODA.newval
+FROM Sales.OrderDetails AS OD
+  INNER JOIN Sales.OrderDetailsAudit AS ODA
+    ON OD.orderid = ODA.orderid
+    AND OD.productid = ODA.productid
+WHERE ODA.columnname = N'qty';
+
+---------------------------------------------------------------------
+-- Non-Equi Joins
+---------------------------------------------------------------------
+
+-- Unique pairs of employees
+SELECT
+  E1.empid, E1.firstname, E1.lastname,
+  E2.empid, E2.firstname, E2.lastname
+FROM HR.Employees AS E1
+  INNER JOIN HR.Employees AS E2
+    ON E1.empid < E2.empid;
+
+---------------------------------------------------------------------
+-- Multi-Join Queries
+---------------------------------------------------------------------
+
+SELECT
+  C.custid, C.companyname, O.orderid,
+  OD.productid, OD.qty
+FROM Sales.Customers AS C
+  INNER JOIN Sales.Orders AS O
+    ON C.custid = O.custid
+  INNER JOIN Sales.OrderDetails AS OD
+    ON O.orderid = OD.orderid;
+
+---------------------------------------------------------------------
+-- Fundamentals of Outer Joins 
+---------------------------------------------------------------------
+
+-- Customers and their orders, including customers with no orders
+SELECT C.custid, C.companyname, O.orderid
+FROM Sales.Customers AS C
+  LEFT OUTER JOIN Sales.Orders AS O
+    ON C.custid = O.custid;
+
+-- Customers with no orders
+SELECT C.custid, C.companyname
+FROM Sales.Customers AS C
+  LEFT OUTER JOIN Sales.Orders AS O
+    ON C.custid = O.custid
+WHERE O.orderid IS NULL;
+
+---------------------------------------------------------------------
+-- Beyond the Fundamentals of Outer Joins
+---------------------------------------------------------------------
+
+---------------------------------------------------------------------
+-- Including Missing Values
+---------------------------------------------------------------------
+
+SELECT DATEADD(day, n-1, CAST('20140101' AS DATE)) AS orderdate
+FROM dbo.Nums
+WHERE n <= DATEDIFF(day, '20140101', '20161231') + 1
+ORDER BY orderdate;
+
+SELECT DATEADD(day, Nums.n - 1, CAST('20140101' AS DATE)) AS orderdate,
+  O.orderid, O.custid, O.empid
+FROM dbo.Nums
+  LEFT OUTER JOIN Sales.Orders AS O
+    ON DATEADD(day, Nums.n - 1, CAST('20140101' AS DATE)) = O.orderdate
+WHERE Nums.n <= DATEDIFF(day, '20140101', '20161231') + 1
+ORDER BY orderdate;
+
+---------------------------------------------------------------------
+-- Filtering Attributes from Non-Preserved Side of Outer Join
+---------------------------------------------------------------------
+
+SELECT C.custid, C.companyname, O.orderid, O.orderdate
+FROM Sales.Customers AS C
+  LEFT OUTER JOIN Sales.Orders AS O
+    ON C.custid = O.custid
+WHERE O.orderdate >= '20160101';
+
+---------------------------------------------------------------------
+-- Using Outer Joins in a Multi-Join Query
+---------------------------------------------------------------------
+
+SELECT C.custid, O.orderid, OD.productid, OD.qty
+FROM Sales.Customers AS C
+  LEFT OUTER JOIN Sales.Orders AS O
+    ON C.custid = O.custid
+  INNER JOIN Sales.OrderDetails AS OD
+    ON O.orderid = OD.orderid;
+
+-- Option 1: use outer join all along
+SELECT C.custid, O.orderid, OD.productid, OD.qty
+FROM Sales.Customers AS C
+  LEFT OUTER JOIN Sales.Orders AS O
+    ON C.custid = O.custid
+  LEFT OUTER JOIN Sales.OrderDetails AS OD
+    ON O.orderid = OD.orderid;
+
+-- Option 2: change join order
+SELECT C.custid, O.orderid, OD.productid, OD.qty
+FROM Sales.Orders AS O
+  INNER JOIN Sales.OrderDetails AS OD
+    ON O.orderid = OD.orderid
+  RIGHT OUTER JOIN Sales.Customers AS C
+     ON O.custid = C.custid;
+
+-- Option 3: use parentheses
+SELECT C.custid, O.orderid, OD.productid, OD.qty
+FROM Sales.Customers AS C
+  LEFT OUTER JOIN
+      (Sales.Orders AS O
+         INNER JOIN Sales.OrderDetails AS OD
+           ON O.orderid = OD.orderid)
+    ON C.custid = O.custid;
+
+---------------------------------------------------------------------
+-- Using the COUNT Aggregate with Outer Joins
+---------------------------------------------------------------------
+
+SELECT C.custid, COUNT(*) AS numorders
+FROM Sales.Customers AS C
+  LEFT OUTER JOIN Sales.Orders AS O
+    ON C.custid = O.custid
+GROUP BY C.custid;
+
+SELECT C.custid, COUNT(O.orderid) AS numorders
+FROM Sales.Customers AS C
+  LEFT OUTER JOIN Sales.Orders AS O
+    ON C.custid = O.custid
+GROUP BY C.custid;
+
+---------------------------------------------------------------------
+-- Self-Contained Subqueries
+---------------------------------------------------------------------
+
+---------------------------------------------------------------------
+-- Scalar Subqueries
+---------------------------------------------------------------------
+
+-- Order with the maximum order ID
+USE TSQLV4;
+
+DECLARE @maxid AS INT = (SELECT MAX(orderid)
+                         FROM Sales.Orders);
+
+SELECT orderid, orderdate, empid, custid
+FROM Sales.Orders
+WHERE orderid = @maxid;
+GO
+
+SELECT orderid, orderdate, empid, custid
+FROM Sales.Orders
+WHERE orderid = (SELECT MAX(O.orderid)
+                 FROM Sales.Orders AS O);
+
+-- Scalar subquery expected to return one value
+SELECT orderid
+FROM Sales.Orders
+WHERE empid = 
+  (SELECT E.empid
+   FROM HR.Employees AS E
+   WHERE E.lastname LIKE N'C%');
+GO
+
+SELECT orderid
+FROM Sales.Orders
+WHERE empid = 
+  (SELECT E.empid
+   FROM HR.Employees AS E
+   WHERE E.lastname LIKE N'D%');
+GO
+
+SELECT orderid
+FROM Sales.Orders
+WHERE empid = 
+  (SELECT E.empid
+   FROM HR.Employees AS E
+   WHERE E.lastname LIKE N'A%');
+
+---------------------------------------------------------------------
+-- Multi-Valued Subqueries
+---------------------------------------------------------------------
+
+SELECT orderid
+FROM Sales.Orders
+WHERE empid IN
+  (SELECT E.empid
+   FROM HR.Employees AS E
+   WHERE E.lastname LIKE N'D%');
+
+SELECT O.orderid
+FROM HR.Employees AS E
+  INNER JOIN Sales.Orders AS O
+    ON E.empid = O.empid
+WHERE E.lastname LIKE N'D%';
+
+-- Orders placed by US customers
+SELECT custid, orderid, orderdate, empid
+FROM Sales.Orders
+WHERE custid IN
+  (SELECT C.custid
+   FROM Sales.Customers AS C
+   WHERE C.country = N'USA');
+
+-- Customers who placed no orders
+SELECT custid, companyname
+FROM Sales.Customers
+WHERE custid NOT IN
+  (SELECT O.custid
+   FROM Sales.Orders AS O);
+
+-- Missing order IDs
+USE TSQLV4;
+DROP TABLE IF EXISTS dbo.Orders;
+CREATE TABLE dbo.Orders(orderid INT NOT NULL CONSTRAINT PK_Orders PRIMARY KEY);
+
+INSERT INTO dbo.Orders(orderid)
+  SELECT orderid
+  FROM Sales.Orders
+  WHERE orderid % 2 = 0;
+
+SELECT n
+FROM dbo.Nums
+WHERE n BETWEEN (SELECT MIN(O.orderid) FROM dbo.Orders AS O)
+            AND (SELECT MAX(O.orderid) FROM dbo.Orders AS O)
+  AND n NOT IN (SELECT O.orderid FROM dbo.Orders AS O);
+
+-- CLeanup
+DROP TABLE IF EXISTS dbo.Orders;
+
+---------------------------------------------------------------------
+-- Correlated Subqueries
+---------------------------------------------------------------------
+
+-- Orders with maximum order ID for each customer
+-- Correlated Subquery
+USE TSQLV4;
+
+SELECT custid, orderid, orderdate, empid
+FROM Sales.Orders AS O1
+WHERE orderid =
+  (SELECT MAX(O2.orderid)
+   FROM Sales.Orders AS O2
+   WHERE O2.custid = O1.custid);
+
+SELECT MAX(O2.orderid)
+FROM Sales.Orders AS O2
+WHERE O2.custid = 85;
+
+-- Percentage of customer total
+SELECT orderid, custid, val,
+  CAST(100. * val / (SELECT SUM(O2.val)
+                     FROM Sales.OrderValues AS O2
+                     WHERE O2.custid = O1.custid)
+       AS NUMERIC(5,2)) AS pct
+FROM Sales.OrderValues AS O1
+ORDER BY custid, orderid;
+
+---------------------------------------------------------------------
+-- EXISTS
+---------------------------------------------------------------------
+
+-- Customers from Spain who placed orders
+SELECT custid, companyname
+FROM Sales.Customers AS C
+WHERE country = N'Spain'
+  AND EXISTS
+    (SELECT * FROM Sales.Orders AS O
+     WHERE O.custid = C.custid);
+
+-- Customers from Spain who didn't place Orders
+SELECT custid, companyname
+FROM Sales.Customers AS C
+WHERE country = N'Spain'
+  AND NOT EXISTS
+    (SELECT * FROM Sales.Orders AS O
+     WHERE O.custid = C.custid);
+
+---------------------------------------------------------------------
+-- Beyond the Fundamentals of Subqueries
+-- (Optional, Advanced)
+---------------------------------------------------------------------
+
+---------------------------------------------------------------------
+-- Returning "Previous" or "Next" Value
+---------------------------------------------------------------------
+SELECT orderid, orderdate, empid, custid,
+  (SELECT MAX(O2.orderid)
+   FROM Sales.Orders AS O2
+   WHERE O2.orderid < O1.orderid) AS prevorderid
+FROM Sales.Orders AS O1;
+
+SELECT orderid, orderdate, empid, custid,
+  (SELECT MIN(O2.orderid)
+   FROM Sales.Orders AS O2
+   WHERE O2.orderid > O1.orderid) AS nextorderid
+FROM Sales.Orders AS O1;
+
+---------------------------------------------------------------------
+-- Running Aggregates
+---------------------------------------------------------------------
+
+SELECT orderyear, qty
+FROM Sales.OrderTotalsByYear;
+
+SELECT orderyear, qty,
+  (SELECT SUM(O2.qty)
+   FROM Sales.OrderTotalsByYear AS O2
+   WHERE O2.orderyear <= O1.orderyear) AS runqty
+FROM Sales.OrderTotalsByYear AS O1
+ORDER BY orderyear;
+
+---------------------------------------------------------------------
+-- Misbehaving Subqueries
+---------------------------------------------------------------------
+
+---------------------------------------------------------------------
+-- NULL Trouble
+---------------------------------------------------------------------
+
+-- Customers who didn't place orders
+
+-- Using NOT IN
+SELECT custid, companyname
+FROM Sales.Customers
+WHERE custid NOT IN(SELECT O.custid
+                    FROM Sales.Orders AS O);
+
+-- Add a row to the Orders table with a NULL custid
+INSERT INTO Sales.Orders
+  (custid, empid, orderdate, requireddate, shippeddate, shipperid,
+   freight, shipname, shipaddress, shipcity, shipregion,
+   shippostalcode, shipcountry)
+  VALUES(NULL, 1, '20160212', '20160212',
+         '20160212', 1, 123.00, N'abc', N'abc', N'abc',
+         N'abc', N'abc', N'abc');
+
+-- Following returns an empty set
+SELECT custid, companyname
+FROM Sales.Customers
+WHERE custid NOT IN(SELECT O.custid
+                    FROM Sales.Orders AS O);
+
+-- Exclude NULLs explicitly
+SELECT custid, companyname
+FROM Sales.Customers
+WHERE custid NOT IN(SELECT O.custid 
+                    FROM Sales.Orders AS O
+                    WHERE O.custid IS NOT NULL);
+
+-- Using NOT EXISTS
+SELECT custid, companyname
+FROM Sales.Customers AS C
+WHERE NOT EXISTS
+  (SELECT * 
+   FROM Sales.Orders AS O
+   WHERE O.custid = C.custid);
+
+-- Cleanup
+DELETE FROM Sales.Orders WHERE custid IS NULL;
+GO
+
+---------------------------------------------------------------------
+-- Substitution Error in a Subquery Column Name
+---------------------------------------------------------------------
+
+-- Create and populate table Sales.MyShippers
+DROP TABLE IF EXISTS Sales.MyShippers;
+
+CREATE TABLE Sales.MyShippers
+(
+  shipper_id  INT          NOT NULL,
+  companyname NVARCHAR(40) NOT NULL,
+  phone       NVARCHAR(24) NOT NULL,
+  CONSTRAINT PK_MyShippers PRIMARY KEY(shipper_id)
+);
+
+INSERT INTO Sales.MyShippers(shipper_id, companyname, phone)
+  VALUES(1, N'Shipper GVSUA', N'(503) 555-0137'),
+	      (2, N'Shipper ETYNR', N'(425) 555-0136'),
+				(3, N'Shipper ZHISN', N'(415) 555-0138');
+GO
+
+-- Shippers who shipped orders to customer 43
+
+-- Bug
+SELECT shipper_id, companyname
+FROM Sales.MyShippers
+WHERE shipper_id IN
+  (SELECT shipper_id
+   FROM Sales.Orders
+   WHERE custid = 43);
+GO
+
+-- The safe way using aliases, bug identified
+SELECT shipper_id, companyname
+FROM Sales.MyShippers
+WHERE shipper_id IN
+  (SELECT O.shipper_id
+   FROM Sales.Orders AS O
+   WHERE O.custid = 43);
+GO
+
+-- Bug corrected
+SELECT shipper_id, companyname
+FROM Sales.MyShippers
+WHERE shipper_id IN
+  (SELECT O.shipperid
+   FROM Sales.Orders AS O
+   WHERE O.custid = 43);
+
+-- Cleanup
+DROP TABLE IF EXISTS Sales.MyShippers;
+
+---------------------------------------------------------------------
+-- Table Expressions
+---------------------------------------------------------------------
+
+---------------------------------------------------------------------
+-- Derived Tables
+---------------------------------------------------------------------
+
+USE TSQLV4;
+
+SELECT *
+FROM (SELECT custid, companyname
+      FROM Sales.Customers
+      WHERE country = N'USA') AS USACusts;
+
+---------------------------------------------------------------------
+-- Assigning Column Aliases
+---------------------------------------------------------------------
+
+-- Following fails
+/*
+SELECT
+  YEAR(orderdate) AS orderyear,
+  COUNT(DISTINCT custid) AS numcusts
+FROM Sales.Orders
+GROUP BY orderyear;
+*/
+GO
+
+-- Query with a Derived Table using Inline Aliasing Form
+SELECT orderyear, COUNT(DISTINCT custid) AS numcusts
+FROM (SELECT YEAR(orderdate) AS orderyear, custid
+      FROM Sales.Orders) AS D
+GROUP BY orderyear;
+
+SELECT YEAR(orderdate) AS orderyear, COUNT(DISTINCT custid) AS numcusts
+FROM Sales.Orders
+GROUP BY YEAR(orderdate);
+
+-- External column aliasing
+SELECT orderyear, COUNT(DISTINCT custid) AS numcusts
+FROM (SELECT YEAR(orderdate), custid
+      FROM Sales.Orders) AS D(orderyear, custid)
+GROUP BY orderyear;
+GO
+
+---------------------------------------------------------------------
+-- Using Arguments
+---------------------------------------------------------------------
+
+-- Yearly Count of Customers handled by Employee 3
+DECLARE @empid AS INT = 3;
+
+SELECT orderyear, COUNT(DISTINCT custid) AS numcusts
+FROM (SELECT YEAR(orderdate) AS orderyear, custid
+      FROM Sales.Orders
+      WHERE empid = @empid) AS D
+GROUP BY orderyear;
+GO
+
+---------------------------------------------------------------------
+-- Nesting
+---------------------------------------------------------------------
+
+-- Query with Nested Derived Tables
+SELECT orderyear, numcusts
+FROM (SELECT orderyear, COUNT(DISTINCT custid) AS numcusts
+      FROM (SELECT YEAR(orderdate) AS orderyear, custid
+            FROM Sales.Orders) AS D1
+      GROUP BY orderyear) AS D2
+WHERE numcusts > 70;
+
+SELECT YEAR(orderdate) AS orderyear, COUNT(DISTINCT custid) AS numcusts
+FROM Sales.Orders
+GROUP BY YEAR(orderdate)
+HAVING COUNT(DISTINCT custid) > 70;
+
+---------------------------------------------------------------------
+-- Multiple References
+---------------------------------------------------------------------
+
+-- Multiple Derived Tables Based on the Same Query
+SELECT Cur.orderyear, 
+  Cur.numcusts AS curnumcusts, Prv.numcusts AS prvnumcusts,
+  Cur.numcusts - Prv.numcusts AS growth
+FROM (SELECT YEAR(orderdate) AS orderyear,
+        COUNT(DISTINCT custid) AS numcusts
+      FROM Sales.Orders
+      GROUP BY YEAR(orderdate)) AS Cur
+  LEFT OUTER JOIN
+     (SELECT YEAR(orderdate) AS orderyear,
+        COUNT(DISTINCT custid) AS numcusts
+      FROM Sales.Orders
+      GROUP BY YEAR(orderdate)) AS Prv
+    ON Cur.orderyear = Prv.orderyear + 1;
+
+---------------------------------------------------------------------
+-- Common Table Expressions
+---------------------------------------------------------------------
+
+WITH USACusts AS
+(
+  SELECT custid, companyname
+  FROM Sales.Customers
+  WHERE country = N'USA'
+)
+SELECT * FROM USACusts;
+
+---------------------------------------------------------------------
+-- Assigning Column Aliases
+---------------------------------------------------------------------
+
+-- Inline column aliasing
+WITH C AS
+(
+  SELECT YEAR(orderdate) AS orderyear, custid
+  FROM Sales.Orders
+)
+SELECT orderyear, COUNT(DISTINCT custid) AS numcusts
+FROM C
+GROUP BY orderyear;
+
+-- External column aliasing
+WITH C(orderyear, custid) AS
+(
+  SELECT YEAR(orderdate), custid
+  FROM Sales.Orders
+)
+SELECT orderyear, COUNT(DISTINCT custid) AS numcusts
+FROM C
+GROUP BY orderyear;
+GO
+
+---------------------------------------------------------------------
+-- Using Arguments
+---------------------------------------------------------------------
+
+DECLARE @empid AS INT = 3;
+
+WITH C AS
+(
+  SELECT YEAR(orderdate) AS orderyear, custid
+  FROM Sales.Orders
+  WHERE empid = @empid
+)
+SELECT orderyear, COUNT(DISTINCT custid) AS numcusts
+FROM C
+GROUP BY orderyear;
+GO
+
+---------------------------------------------------------------------
+-- Defining Multiple CTEs
+---------------------------------------------------------------------
+
+WITH C1 AS
+(
+  SELECT YEAR(orderdate) AS orderyear, custid
+  FROM Sales.Orders
+),
+C2 AS
+(
+  SELECT orderyear, COUNT(DISTINCT custid) AS numcusts
+  FROM C1
+  GROUP BY orderyear
+)
+SELECT orderyear, numcusts
+FROM C2
+WHERE numcusts > 70;
+
+---------------------------------------------------------------------
+-- Multiple References
+---------------------------------------------------------------------
+
+WITH YearlyCount AS
+(
+  SELECT YEAR(orderdate) AS orderyear,
+    COUNT(DISTINCT custid) AS numcusts
+  FROM Sales.Orders
+  GROUP BY YEAR(orderdate)
+)
+SELECT Cur.orderyear, 
+  Cur.numcusts AS curnumcusts, Prv.numcusts AS prvnumcusts,
+  Cur.numcusts - Prv.numcusts AS growth
+FROM YearlyCount AS Cur
+  LEFT OUTER JOIN YearlyCount AS Prv
+    ON Cur.orderyear = Prv.orderyear + 1;
+
+---------------------------------------------------------------------
+-- Recursive CTEs (Optional, Advanced)
+---------------------------------------------------------------------
+
+WITH EmpsCTE AS
+(
+  SELECT empid, mgrid, firstname, lastname
+  FROM HR.Employees
+  WHERE empid = 2
+  
+  UNION ALL
+  
+  SELECT C.empid, C.mgrid, C.firstname, C.lastname
+  FROM EmpsCTE AS P
+    INNER JOIN HR.Employees AS C
+      ON C.mgrid = P.empid
+)
+SELECT empid, mgrid, firstname, lastname
+FROM EmpsCTE;
+
+---------------------------------------------------------------------
+-- Views
+---------------------------------------------------------------------
+
+---------------------------------------------------------------------
+-- Views Described
+---------------------------------------------------------------------
+
+-- Creating USACusts View
+DROP VIEW IF EXISTS Sales.USACusts;
+GO
+CREATE VIEW Sales.USACusts
+AS
+
+SELECT
+  custid, companyname, contactname, contacttitle, address,
+  city, region, postalcode, country, phone, fax
+FROM Sales.Customers
+WHERE country = N'USA';
+GO
+
+SELECT custid, companyname
+FROM Sales.USACusts;
+GO
+
+---------------------------------------------------------------------
+-- Views and ORDER BY
+---------------------------------------------------------------------
+
+-- ORDER BY in a View is not Allowed
+/*
+ALTER VIEW Sales.USACusts
+AS
+
+SELECT
+  custid, companyname, contactname, contacttitle, address,
+  city, region, postalcode, country, phone, fax
+FROM Sales.Customers
+WHERE country = N'USA'
+ORDER BY region;
+GO
+*/
+
+-- Instead, use ORDER BY in Outer Query
+SELECT custid, companyname, region
+FROM Sales.USACusts
+ORDER BY region;
+GO
+
+-- Do not Rely on TOP 
+ALTER VIEW Sales.USACusts
+AS
+
+SELECT TOP (100) PERCENT
+  custid, companyname, contactname, contacttitle, address,
+  city, region, postalcode, country, phone, fax
+FROM Sales.Customers
+WHERE country = N'USA'
+ORDER BY region;
+GO
+
+-- Query USACusts
+SELECT custid, companyname, region
+FROM Sales.USACusts;
+GO
+
+-- DO NOT rely on OFFSET-FETCH, even if for now the engine does return rows in rder
+ALTER VIEW Sales.USACusts
+AS
+
+SELECT 
+  custid, companyname, contactname, contacttitle, address,
+  city, region, postalcode, country, phone, fax
+FROM Sales.Customers
+WHERE country = N'USA'
+ORDER BY region
+OFFSET 0 ROWS;
+GO
+
+-- Query USACusts
+SELECT custid, companyname, region
+FROM Sales.USACusts;
+GO
+
+---------------------------------------------------------------------
+-- View Options
+---------------------------------------------------------------------
+
+---------------------------------------------------------------------
+-- ENCRYPTION
+---------------------------------------------------------------------
+
+ALTER VIEW Sales.USACusts
+AS
+
+SELECT
+  custid, companyname, contactname, contacttitle, address,
+  city, region, postalcode, country, phone, fax
+FROM Sales.Customers
+WHERE country = N'USA';
+GO
+
+SELECT OBJECT_DEFINITION(OBJECT_ID('Sales.USACusts'));
+GO
+
+ALTER VIEW Sales.USACusts WITH ENCRYPTION
+AS
+
+SELECT
+  custid, companyname, contactname, contacttitle, address,
+  city, region, postalcode, country, phone, fax
+FROM Sales.Customers
+WHERE country = N'USA';
+GO
+
+SELECT OBJECT_DEFINITION(OBJECT_ID('Sales.USACusts'));
+
+EXEC sp_helptext 'Sales.USACusts';
+GO
+
+---------------------------------------------------------------------
+-- SCHEMABINDING
+---------------------------------------------------------------------
+
+ALTER VIEW Sales.USACusts WITH SCHEMABINDING
+AS
+
+SELECT
+  custid, companyname, contactname, contacttitle, address,
+  city, region, postalcode, country, phone, fax
+FROM Sales.Customers
+WHERE country = N'USA';
+GO
+
+-- Try a schema change
+/*
+ALTER TABLE Sales.Customers DROP COLUMN address;
+*/
+GO
+
+---------------------------------------------------------------------
+-- CHECK OPTION
+---------------------------------------------------------------------
+
+-- Notice that you can insert a row through the view
+INSERT INTO Sales.USACusts(
+  companyname, contactname, contacttitle, address,
+  city, region, postalcode, country, phone, fax)
+ VALUES(
+  N'Customer ABCDE', N'Contact ABCDE', N'Title ABCDE', N'Address ABCDE',
+  N'London', NULL, N'12345', N'UK', N'012-3456789', N'012-3456789');
+
+-- But when you query the view, you won't see it
+SELECT custid, companyname, country
+FROM Sales.USACusts
+WHERE companyname = N'Customer ABCDE';
+
+-- You can see it in the table, though
+SELECT custid, companyname, country
+FROM Sales.Customers
+WHERE companyname = N'Customer ABCDE';
+GO
+
+-- Add CHECK OPTION to the View
+ALTER VIEW Sales.USACusts WITH SCHEMABINDING
+AS
+
+SELECT
+  custid, companyname, contactname, contacttitle, address,
+  city, region, postalcode, country, phone, fax
+FROM Sales.Customers
+WHERE country = N'USA'
+WITH CHECK OPTION;
+GO
+
+-- Notice that you can't insert a row through the view
+/*
+INSERT INTO Sales.USACusts(
+  companyname, contactname, contacttitle, address,
+  city, region, postalcode, country, phone, fax)
+ VALUES(
+  N'Customer FGHIJ', N'Contact FGHIJ', N'Title FGHIJ', N'Address FGHIJ',
+  N'London', NULL, N'12345', N'UK', N'012-3456789', N'012-3456789');
+*/
+GO
+
+-- Cleanup
+DELETE FROM Sales.Customers
+WHERE custid > 91;
+
+DROP VIEW IF EXISTS Sales.USACusts;
+GO
+
+---------------------------------------------------------------------
+-- Inline User Defined Functions
+---------------------------------------------------------------------
+
+-- Creating GetCustOrders function
+USE TSQLV4;
+DROP FUNCTION IF EXISTS dbo.GetCustOrders;
+GO
+CREATE FUNCTION dbo.GetCustOrders
+  (@cid AS INT) RETURNS TABLE
+AS
+RETURN
+  SELECT orderid, custid, empid, orderdate, requireddate,
+    shippeddate, shipperid, freight, shipname, shipaddress, shipcity,
+    shipregion, shippostalcode, shipcountry
+  FROM Sales.Orders
+  WHERE custid = @cid;
+GO
+
+-- Test Function
+SELECT orderid, custid
+FROM dbo.GetCustOrders(1) AS O;
+
+SELECT O.orderid, O.custid, OD.productid, OD.qty
+FROM dbo.GetCustOrders(1) AS O
+  INNER JOIN Sales.OrderDetails AS OD
+    ON O.orderid = OD.orderid;
+GO
+
+-- Cleanup
+DROP FUNCTION IF EXISTS dbo.GetCustOrders;
+GO
+
+---------------------------------------------------------------------
+-- APPLY
+---------------------------------------------------------------------
+
+SELECT S.shipperid, E.empid
+FROM Sales.Shippers AS S
+  CROSS JOIN HR.Employees AS E;
+
+SELECT S.shipperid, E.empid
+FROM Sales.Shippers AS S
+  CROSS APPLY HR.Employees AS E;
+
+-- 3 most recent orders for each customer
+SELECT C.custid, A.orderid, A.orderdate
+FROM Sales.Customers AS C
+  CROSS APPLY
+    (SELECT TOP (3) orderid, empid, orderdate, requireddate 
+     FROM Sales.Orders AS O
+     WHERE O.custid = C.custid
+     ORDER BY orderdate DESC, orderid DESC) AS A;
+
+-- With OFFSET-FETCH
+SELECT C.custid, A.orderid, A.orderdate
+FROM Sales.Customers AS C
+  CROSS APPLY
+    (SELECT orderid, empid, orderdate, requireddate 
+     FROM Sales.Orders AS O
+     WHERE O.custid = C.custid
+     ORDER BY orderdate DESC, orderid DESC
+     OFFSET 0 ROWS FETCH NEXT 3 ROWS ONLY) AS A;
+
+-- 3 most recent orders for each customer, preserve customers
+SELECT C.custid, A.orderid, A.orderdate
+FROM Sales.Customers AS C
+  OUTER APPLY
+    (SELECT TOP (3) orderid, empid, orderdate, requireddate 
+     FROM Sales.Orders AS O
+     WHERE O.custid = C.custid
+     ORDER BY orderdate DESC, orderid DESC) AS A;
+
+-- Creation Script for the Function TopOrders
+DROP FUNCTION IF EXISTS dbo.TopOrders;
+GO
+CREATE FUNCTION dbo.TopOrders
+  (@custid AS INT, @n AS INT)
+  RETURNS TABLE
+AS
+RETURN
+  SELECT TOP (@n) orderid, empid, orderdate, requireddate 
+  FROM Sales.Orders
+  WHERE custid = @custid
+  ORDER BY orderdate DESC, orderid DESC;
+GO
+
+SELECT
+  C.custid, C.companyname,
+  A.orderid, A.empid, A.orderdate, A.requireddate 
+FROM Sales.Customers AS C
+  CROSS APPLY dbo.TopOrders(C.custid, 3) AS A;
+
+---------------------------------------------------------------------
+-- Set Operators
+---------------------------------------------------------------------
+
+SET NOCOUNT ON
+USE TSQLV4;
+
+---------------------------------------------------------------------
+-- The UNION Operator
+---------------------------------------------------------------------
+
+-- The UNION ALL Multiset Operator
+SELECT country, region, city FROM HR.Employees
+UNION ALL
+SELECT country, region, city FROM Sales.Customers;
+
+-- The UNION Distinct Set Operator
+SELECT country, region, city FROM HR.Employees
+UNION
+SELECT country, region, city FROM Sales.Customers;
+
+---------------------------------------------------------------------
+-- The INTERSECT Operator
+---------------------------------------------------------------------
+
+-- The INTERSECT Distinct Set Operator
+SELECT country, region, city FROM HR.Employees
+INTERSECT
+SELECT country, region, city FROM Sales.Customers;
+
+-- The INTERSECT ALL Multiset Operator (Optional, Advanced)
+SELECT
+  ROW_NUMBER() 
+    OVER(PARTITION BY country, region, city
+         ORDER     BY (SELECT 0)) AS rownum,
+  country, region, city
+FROM HR.Employees
+
+INTERSECT
+
+SELECT
+  ROW_NUMBER() 
+    OVER(PARTITION BY country, region, city
+         ORDER     BY (SELECT 0)),
+  country, region, city
+FROM Sales.Customers;
+
+WITH INTERSECT_ALL
+AS
+(
+  SELECT
+    ROW_NUMBER() 
+      OVER(PARTITION BY country, region, city
+           ORDER     BY (SELECT 0)) AS rownum,
+    country, region, city
+  FROM HR.Employees
+
+  INTERSECT
+
+  SELECT
+    ROW_NUMBER() 
+      OVER(PARTITION BY country, region, city
+           ORDER     BY (SELECT 0)),
+    country, region, city
+  FROM Sales.Customers
+)
+SELECT country, region, city
+FROM INTERSECT_ALL;
+
+---------------------------------------------------------------------
+-- The EXCEPT Operator
+---------------------------------------------------------------------
+
+-- The EXCEPT Distinct Set Operator
+
+-- Employees EXCEPT Customers
+SELECT country, region, city FROM HR.Employees
+EXCEPT
+SELECT country, region, city FROM Sales.Customers;
+
+-- Customers EXCEPT Employees
+SELECT country, region, city FROM Sales.Customers
+EXCEPT
+SELECT country, region, city FROM HR.Employees;
+
+-- The EXCEPT ALL Multiset Operator (Optional, Advanced)
+WITH EXCEPT_ALL
+AS
+(
+  SELECT
+    ROW_NUMBER() 
+      OVER(PARTITION BY country, region, city
+           ORDER     BY (SELECT 0)) AS rownum,
+    country, region, city
+  FROM HR.Employees
+
+  EXCEPT
+
+  SELECT
+    ROW_NUMBER() 
+      OVER(PARTITION BY country, region, city
+           ORDER     BY (SELECT 0)),
+    country, region, city
+  FROM Sales.Customers
+)
+SELECT country, region, city
+FROM EXCEPT_ALL;
+
+---------------------------------------------------------------------
+-- Precedence
+---------------------------------------------------------------------
+
+-- INTERSECT Precedes EXCEPT
+SELECT country, region, city FROM Production.Suppliers
+EXCEPT
+SELECT country, region, city FROM HR.Employees
+INTERSECT
+SELECT country, region, city FROM Sales.Customers;
+
+-- Using Parenthesis
+(SELECT country, region, city FROM Production.Suppliers
+ EXCEPT
+ SELECT country, region, city FROM HR.Employees)
+INTERSECT
+SELECT country, region, city FROM Sales.Customers;
+
+---------------------------------------------------------------------
+-- Circumventing Unsupported Logical Phases
+-- (Optional, Advanced)
+---------------------------------------------------------------------
+
+-- Number of distinct locations
+-- that are either employee or customer locations in each country
+SELECT country, COUNT(*) AS numlocations
+FROM (SELECT country, region, city FROM HR.Employees
+      UNION
+      SELECT country, region, city FROM Sales.Customers) AS U
+GROUP BY country;
+
+-- Two most recent orders for employees 3 and 5
+SELECT empid, orderid, orderdate
+FROM (SELECT TOP (2) empid, orderid, orderdate
+      FROM Sales.Orders
+      WHERE empid = 3
+      ORDER BY orderdate DESC, orderid DESC) AS D1
+
+UNION ALL
+
+SELECT empid, orderid, orderdate
+FROM (SELECT TOP (2) empid, orderid, orderdate
+      FROM Sales.Orders
+      WHERE empid = 5
+      ORDER BY orderdate DESC, orderid DESC) AS D2;
+
+---------------------------------------------------------------------
+-- Recent T-SQL Additions
+---------------------------------------------------------------------
+
+---------------------------------------------------------------------
+-- DROP IF EXISTS, CREATE OR ALTER
+---------------------------------------------------------------------
+
+-- instead of
+IF OBJECT_ID(N'dbo.T1', N'U') IS NOT NULL DROP TABLE dbo.T1;
+IF OBJECT_ID(N'dbo.T2', N'U') IS NOT NULL DROP TABLE dbo.T2;
+-- use
+DROP TABLE /* VIEW, FUNCTION, PROC, … */ IF EXISTS dbo.T1, dbo.T2;
+
+-- CREATE OR ALTER
+CREATE OR ALTER VIEW dbo.MyView
+AS
+
+SELECT 'Isn''t It?' AS [This is great!];
+GO
+
+SELECT * FROM dbo.MyView;
+
+---------------------------------------------------------------------
+-- TRIM
+---------------------------------------------------------------------
+
+DECLARE @str AS VARCHAR(100) = '   abc   ';
+
+-- instead of
+SELECT LTRIM(RTRIM(@str));
+-- use
+SELECT TRIM(@str);
+
+---------------------------------------------------------------------
+-- STRING_SPLIT
+---------------------------------------------------------------------
+
+USE TSQLV4;
+GO
+
+CREATE OR ALTER FUNCTION dbo.GetOrders(@arr AS VARCHAR(8000)) RETURNS TABLE
+AS
+RETURN
+  SELECT O.orderid, O.orderdate, O.custid, O.empid
+  FROM Sales.Orders AS O
+    INNER JOIN STRING_SPLIT(@arr, ',') AS S
+      ON O.orderid = CAST(S.value AS INT);
+GO
+
+SELECT orderid, orderdate, custid, empid
+FROM dbo.GetOrders('10248,10249,10250') AS O;
+
+---------------------------------------------------------------------
+-- STRING_AGG
+---------------------------------------------------------------------
+
+SELECT custid,
+  STRING_AGG(orderid, ',') WITHIN GROUP(ORDER BY orderdate DESC, orderid DESC) AS custorders
+FROM Sales.Orders
+GROUP BY custid;
+
+---------------------------------------------------------------------
+-- DATEDIFF_BIG
+---------------------------------------------------------------------
+
+-- fails
+SELECT DATEDIFF(ms, '19710212', '20260212');
+
+-- succeeds
+SELECT DATEDIFF_BIG(ms, '19710212', '20260212');
+
+---------------------------------------------------------------------
+-- AT TIME ZONE
+---------------------------------------------------------------------
+
+-- Get time zone info
+SELECT name, current_utc_offset, is_currently_dst
+FROM sys.time_zone_info;
+
+-- Converting non-datetimeoffset values
+-- behavior similar to TODATETIMEOFFSET
+SELECT
+  CAST('20160212 12:00:00.0000000' AS DATETIME2)
+    AT TIME ZONE 'Pacific Standard Time' AS val1,
+  CAST('20160812 12:00:00.0000000' AS DATETIME2)
+    AT TIME ZONE 'Pacific Standard Time' AS val2;
+
+-- Converting datetimeoffset values
+-- behavior similar to SWITCHOFFSET
+SELECT
+  CAST('20160212 12:00:00.0000000 -05:00' AS DATETIMEOFFSET)
+    AT TIME ZONE 'Pacific Standard Time' AS val1,
+  CAST('20160812 12:00:00.0000000 -04:00' AS DATETIMEOFFSET)
+    AT TIME ZONE 'Pacific Standard Time' AS val2;
+
+---------------------------------------------------------------------
+-- Temporal Tables
+---------------------------------------------------------------------
+
+---------------------------------------------------------------------
+-- Creating new temporal tables
+---------------------------------------------------------------------
+
+-- Sample database and cleanup
+SET NOCOUNT ON;
+IF DB_ID(N'TemporalDB') IS NULL CREATE DATABASE TemporalDB;
+GO
+USE TemporalDB;
+GO
+IF OBJECT_ID(N'dbo.Employees', N'U') IS NOT NULL
+BEGIN
+  IF OBJECTPROPERTY(OBJECT_ID(N'dbo.Employees', N'U'), N'TableTemporalType') = 2
+    ALTER TABLE dbo.Employees SET ( SYSTEM_VERSIONING = OFF );
+  IF OBJECT_ID(N'dbo.EmployeesHistory', N'U') IS NOT NULL
+    DROP TABLE dbo.EmployeesHistory;
+  DROP TABLE dbo.Employees;
+END;
+GO
+
+-- Creating a new system-versioned temporal table and letting SQL Server create the history table
+CREATE TABLE dbo.Employees
+(
+  empid INT NOT NULL
+    CONSTRAINT PK_Employees PRIMARY KEY NONCLUSTERED,
+  mgrid INT NULL
+    CONSTRAINT FK_Employees_mgr_emp REFERENCES dbo.Employees,
+  empname VARCHAR(25) NOT NULL,
+  sysstart DATETIME2(0) GENERATED ALWAYS AS ROW START NOT NULL,
+  sysend DATETIME2(0) GENERATED ALWAYS AS ROW END NOT NULL,
+  PERIOD FOR SYSTEM_TIME (sysstart, sysend)
+)
+WITH ( SYSTEM_VERSIONING = ON ( HISTORY_TABLE = dbo.EmployeesHistory ) );
+GO
+
+CREATE UNIQUE CLUSTERED INDEX ix_Employees
+  ON dbo.Employees(empid, sysstart, sysend);
+GO
+
+-- To make a regular table a system-versioned temporal table use ALTER TABLE (don't run this)
+/*
+BEGIN TRAN;
+
+-- Add required period columns and designation
+ALTER TABLE dbo.Employees ADD
+  sysstart DATETIME2(0) GENERATED ALWAYS AS ROW START NOT NULL
+    CONSTRAINT DFT_Employees_sysstart DEFAULT('19000101'),
+  sysend DATETIME2(0) GENERATED ALWAYS AS ROW END NOT NULL
+    CONSTRAINT DFT_Employees_sysend DEFAULT('99991231 23:59:59'),
+  PERIOD FOR SYSTEM_TIME (sysstart, sysend);
+
+-- Remove temporary DEFAULT constraints
+ALTER TABLE dbo.Employees
+  DROP CONSTRAINT DFT_Employees_sysstart, DFT_Employees_sysend;
+
+-- Turn system versioning on
+ALTER TABLE dbo.Employees
+  SET ( SYSTEM_VERSIONING = ON ( HISTORY_TABLE = dbo.EmployeesHistory ) );
+
+COMMIT TRAN;
+*/
+
+-- To apply a change that isn't allowed while system-versioning is on (don't run this)
+/*
+BEGIN TRAN;
+
+-- Turn system versioning off
+ALTER TABLE dbo.Employees SET ( SYSTEM_VERSIONING = OFF );
+
+... apply your change here ...
+
+-- Turn system versioning back on
+ALTER TABLE dbo.Employees
+  SET ( SYSTEM_VERSIONING = ON
+        ( HISTORY_TABLE = dbo.EmployeesHistory,
+          DATA_CONSISTENCY_CHECK = ON ) );
+
+COMMIT TRAN;
+*/
+
+---------------------------------------------------------------------
+-- Modifying data
+---------------------------------------------------------------------
+
+-- Add rows at T1 (2016-04-26 19:54:04 UTC)
+INSERT INTO dbo.Employees(empid, mgrid, empname)
+  VALUES(1, NULL, 'David'),
+        (2, 1, 'Eitan');
+
+-- Add more rows in an explicit transaction that started at T2 (BEGIN TRAN statement time) (2016-04-26 19:54:20)
+BEGIN TRAN;
+
+  PRINT 'Transaction start time: ' + CONVERT(CHAR(19), SYSDATETIME(), 121);
+
+  INSERT INTO dbo.Employees(empid, mgrid, empname)
+    VALUES(4, 2, 'Seraph'),
+          (5, 2, 'Jiru');
+  
+  WAITFOR DELAY '00:00:05';
+
+  INSERT INTO dbo.Employees(empid, mgrid, empname)
+    VALUES(6, 2, 'Steve');
+
+  PRINT 'Transaction end time: ' + CONVERT(CHAR(19), SYSDATETIME(), 121);
+
+COMMIT TRAN;
+
+-- Add more rows at T3 (2016-04-26 20:01:41)
+INSERT INTO dbo.Employees(empid, mgrid, empname)
+  VALUES(8, 5, 'Lilach'),
+        (10, 5, 'Sean'),
+        (3, 1, 'Ina'),
+        (7, 3, 'Aaron'),
+        (9, 7, 'Rita'),
+        (11, 7, 'Gabriel'),
+        (12, 9, 'Emilia'),
+        (13, 9, 'Michael'),
+        (14, 9, 'Didi');
+
+-- Show table contents
+SELECT *
+FROM dbo.Employees;
+
+-- History table empty at this point
+SELECT *
+FROM dbo.EmployeesHistory;
+
+-- Make some changes at T4 (2016-04-26 20:11:01)
+BEGIN TRAN;
+
+  DELETE FROM dbo.Employees
+  WHERE empid IN (13, 14);
+
+  UPDATE dbo.Employees
+    SET mgrid = 3
+  WHERE empid IN(9, 11);
+
+COMMIT TRAN;
+
+-- Make some more changes at T5 (2016-04-26 21:32:20)
+BEGIN TRAN;
+
+  UPDATE dbo.Employees
+    SET mgrid = 4
+  WHERE empid IN(7, 9);
+
+  UPDATE dbo.Employees
+    SET mgrid = 3
+  WHERE empid = 6;
+
+  UPDATE dbo.Employees
+    SET mgrid = 6
+  WHERE empid = 11;
+
+  DELETE FROM dbo.Employees
+  WHERE empid = 12;
+
+COMMIT TRAN;
+
+-- Show current table contents
+SELECT *
+FROM dbo.Employees;
+
+-- Show history table contents
+SELECT *
+FROM dbo.EmployeesHistory;
+
+---------------------------------------------------------------------
+-- Create sample data to be consistent with examples in module
+---------------------------------------------------------------------
+
+-- Create TemporalDB database and drop tables if exist
+SET NOCOUNT ON;
+IF DB_ID(N'TemporalDB') IS NULL CREATE DATABASE TemporalDB;
+GO
+USE TemporalDB;
+GO
+IF OBJECT_ID(N'dbo.Employees', N'U') IS NOT NULL
+BEGIN
+  IF OBJECTPROPERTY(OBJECT_ID(N'dbo.Employees', N'U'), N'TableTemporalType') = 2
+    ALTER TABLE dbo.Employees SET ( SYSTEM_VERSIONING = OFF );
+  IF OBJECT_ID(N'dbo.EmployeesHistory', N'U') IS NOT NULL
+    DROP TABLE dbo.EmployeesHistory;
+  DROP TABLE dbo.Employees;
+END;
+GO
+
+-- Create and populate Employees table
+CREATE TABLE dbo.Employees
+(
+  empid INT NOT NULL
+    CONSTRAINT PK_Employees PRIMARY KEY NONCLUSTERED,
+  mgrid INT NULL
+    CONSTRAINT FK_Employees_mgr_emp REFERENCES dbo.Employees,
+  empname VARCHAR(25) NOT NULL,
+  sysstart DATETIME2(0) NOT NULL,
+  sysend DATETIME2(0) NOT NULL
+);
+
+CREATE UNIQUE CLUSTERED INDEX ix_Employees
+  ON dbo.Employees(empid, sysstart, sysend);
+
+INSERT INTO dbo.Employees(empid, mgrid, empname, sysstart, sysend) VALUES
+  (1 , NULL, 'David'  , '2016-04-26 19:54:04', '9999-12-31 23:59:59'),
+  (2 , 1   , 'Eitan'  , '2016-04-26 19:54:04', '9999-12-31 23:59:59'),
+  (3 , 1   , 'Ina'    , '2016-04-26 20:01:41', '9999-12-31 23:59:59'),
+  (4 , 2   , 'Seraph' , '2016-04-26 19:54:20', '9999-12-31 23:59:59'),
+  (5 , 2   , 'Jiru'   , '2016-04-26 19:54:20', '9999-12-31 23:59:59'),
+  (6 , 3   , 'Steve'  , '2016-04-26 21:32:20', '9999-12-31 23:59:59'),
+  (7 , 4   , 'Aaron'  , '2016-04-26 21:32:20', '9999-12-31 23:59:59'),
+  (8 , 5   , 'Lilach' , '2016-04-26 20:01:41', '9999-12-31 23:59:59'),
+  (9 , 4   , 'Rita'   , '2016-04-26 21:32:20', '9999-12-31 23:59:59'),
+  (10, 5   , 'Sean'   , '2016-04-26 20:01:41', '9999-12-31 23:59:59'),
+  (11, 6   , 'Gabriel', '2016-04-26 21:32:20', '9999-12-31 23:59:59');
+
+-- Create and populate EmployeesHistory table
+CREATE TABLE dbo.EmployeesHistory
+(
+  empid INT NOT NULL,
+  mgrid INT NULL,
+  empname VARCHAR(25) NOT NULL,
+  sysstart DATETIME2(0) NOT NULL,
+  sysend DATETIME2(0) NOT NULL
+);
+
+CREATE CLUSTERED INDEX ix_EmployeesHistory
+  ON dbo.EmployeesHistory(sysend, sysstart)
+  WITH (DATA_COMPRESSION = PAGE);
+
+INSERT INTO dbo.EmployeesHistory(empid, mgrid, empname, sysstart, sysend) VALUES
+(6 , 2, 'Steve'  , '2016-04-26 19:54:20', '2016-04-26 21:32:20'),
+(7 , 3, 'Aaron'  , '2016-04-26 20:01:41', '2016-04-26 21:32:20'),
+(9 , 7, 'Rita'   , '2016-04-26 20:01:41', '2016-04-26 20:11:01'),
+(9 , 3, 'Rita'   , '2016-04-26 20:11:01', '2016-04-26 21:32:20'),
+(11, 7, 'Gabriel', '2016-04-26 20:01:41', '2016-04-26 20:11:01'),
+(11, 3, 'Gabriel', '2016-04-26 20:11:01', '2016-04-26 21:32:20'),
+(12, 9, 'Emilia' , '2016-04-26 20:01:41', '2016-04-26 21:32:20'),
+(13, 9, 'Michael', '2016-04-26 20:01:41', '2016-04-26 20:11:01'),
+(14, 9, 'Didi'   , '2016-04-26 20:01:41', '2016-04-26 20:11:01');
+
+-- Enable system versioning
+ALTER TABLE dbo.Employees ADD
+  PERIOD FOR SYSTEM_TIME (sysstart, sysend);
+
+ALTER TABLE dbo.Employees
+  SET ( SYSTEM_VERSIONING = ON ( HISTORY_TABLE = dbo.EmployeesHistory ) );
+GO
+
+---------------------------------------------------------------------
+-- Querying Data
+---------------------------------------------------------------------
+
+-- Without the FOR SYSTEM_TIME clause, queries against the current table
+-- are accessed and optimized as usual and history table is ignored
+SELECT *
+FROM dbo.Employees;
+
+-- Query with FOR SYSTEM_TIME AS OF @datetime
+-- sysstart <= @datetime AND sysend > @datetime
+DECLARE @datetime AS DATETIME2(0) = '2016-04-26 20:11:01';
+
+SELECT *
+FROM dbo.Employees FOR SYSTEM_TIME AS OF @datetime;
+
+-- Equivalent to using the following query
+SELECT *
+FROM dbo.Employees
+WHERE sysstart <= @datetime
+  AND sysend > @datetime
+  
+UNION ALL
+
+SELECT *
+FROM dbo.EmployeesHistory
+WHERE sysstart <= @datetime
+  AND sysend > @datetime;
+GO
+
+-- FOR SYSTEM_TIME FROM @start TO @end 
+-- sysstart < @end AND sysend > @start
+-- Validity interval starts before input interval ends and ends after input interval starts
+
+SELECT *
+FROM dbo.Employees
+  FOR SYSTEM_TIME FROM '2016-04-26 20:00:00' TO '2016-04-26 20:01:41';
+
+SELECT *
+FROM dbo.Employees
+  FOR SYSTEM_TIME BETWEEN '2016-04-26 20:00:00' AND '2016-04-26 20:01:41';
+
+-- FOR SYSTEM_TIME CONTAINED IN(@start, @end)
+-- sysstart >= @start AND sysend <= @end
+-- Validity interval starts on or after input interval starts and ends on or before input interval ends
+
+SELECT *
+FROM dbo.Employees
+  FOR SYSTEM_TIME CONTAINED IN('2016-04-26 20:00:00', '2016-04-26 20:20:00');
+
+-- To get all versions
+SELECT *
+FROM dbo.Employees FOR SYSTEM_TIME ALL;
+
+---------------------------------------------------------------------
+-- Beyond the Fundamentals(as time permits)
+---------------------------------------------------------------------
+
+---------------------------------------------------------------------
+-- Window Functions
+---------------------------------------------------------------------
+
+---------------------------------------------------------------------
+-- Window Functions, Described
+---------------------------------------------------------------------
+
+USE TSQLV4;
+
+SELECT empid, ordermonth, val,
+  SUM(val) OVER(PARTITION BY empid
+                ORDER BY ordermonth
+                ROWS BETWEEN UNBOUNDED PRECEDING
+                         AND CURRENT ROW) AS runval
+FROM Sales.EmpOrders;
+
+---------------------------------------------------------------------
+-- Ranking Window Functions
+---------------------------------------------------------------------
+
+SELECT orderid, custid, val,
+  ROW_NUMBER() OVER(ORDER BY val) AS rownum,
+  RANK()       OVER(ORDER BY val) AS rank,
+  DENSE_RANK() OVER(ORDER BY val) AS dense_rank,
+  NTILE(10)    OVER(ORDER BY val) AS ntile
+FROM Sales.OrderValues
+ORDER BY val;
+
+SELECT orderid, custid, val,
+  ROW_NUMBER() OVER(PARTITION BY custid
+                    ORDER BY val) AS rownum
+FROM Sales.OrderValues
+ORDER BY custid, val;
+
+SELECT DISTINCT val, ROW_NUMBER() OVER(ORDER BY val) AS rownum
+FROM Sales.OrderValues;
+
+SELECT val, ROW_NUMBER() OVER(ORDER BY val) AS rownum
+FROM Sales.OrderValues
+GROUP BY val;
+
+---------------------------------------------------------------------
+-- Offset Window Functions
+---------------------------------------------------------------------
+
+-- LAG and LEAD
+SELECT custid, orderid, val,
+  LAG(val)  OVER(PARTITION BY custid
+                 ORDER BY orderdate, orderid) AS prevval,
+  LEAD(val) OVER(PARTITION BY custid
+                 ORDER BY orderdate, orderid) AS nextval
+FROM Sales.OrderValues
+ORDER BY custid, orderdate, orderid;
+
+-- FIRST_VALUE and LAST_VALUE
+SELECT custid, orderid, val,
+  FIRST_VALUE(val) OVER(PARTITION BY custid
+                        ORDER BY orderdate, orderid
+                        ROWS BETWEEN UNBOUNDED PRECEDING
+                                 AND CURRENT ROW) AS firstval,
+  LAST_VALUE(val)  OVER(PARTITION BY custid
+                        ORDER BY orderdate, orderid
+                        ROWS BETWEEN CURRENT ROW
+                                 AND UNBOUNDED FOLLOWING) AS lastval
+FROM Sales.OrderValues
+ORDER BY custid, orderdate, orderid;
+
+---------------------------------------------------------------------
+-- Aggregate Window Functions
+---------------------------------------------------------------------
+
+SELECT orderid, custid, val,
+  SUM(val) OVER() AS totalvalue,
+  SUM(val) OVER(PARTITION BY custid) AS custtotalvalue
+FROM Sales.OrderValues;
+
+SELECT orderid, custid, val,
+  100. * val / SUM(val) OVER() AS pctall,
+  100. * val / SUM(val) OVER(PARTITION BY custid) AS pctcust
+FROM Sales.OrderValues;
+
+SELECT empid, ordermonth, val,
+  SUM(val) OVER(PARTITION BY empid
+                ORDER BY ordermonth
+                ROWS BETWEEN UNBOUNDED PRECEDING
+                         AND CURRENT ROW) AS runval
+FROM Sales.EmpOrders;
+
+---------------------------------------------------------------------
+-- Pivoting Data
+---------------------------------------------------------------------
+
+-- Code to Create and Populate the Orders Table
+USE TSQLV4;
+
+DROP TABLE IF EXISTS dbo.Orders;
+GO
+
+CREATE TABLE dbo.Orders
+(
+  orderid   INT        NOT NULL,
+  orderdate DATE       NOT NULL,
+  empid     INT        NOT NULL,
+  custid    VARCHAR(5) NOT NULL,
+  qty       INT        NOT NULL,
+  CONSTRAINT PK_Orders PRIMARY KEY(orderid)
+);
+
+INSERT INTO dbo.Orders(orderid, orderdate, empid, custid, qty)
+VALUES
+  (30001, '20140802', 3, 'A', 10),
+  (10001, '20141224', 2, 'A', 12),
+  (10005, '20141224', 1, 'B', 20),
+  (40001, '20150109', 2, 'A', 40),
+  (10006, '20150118', 1, 'C', 14),
+  (20001, '20150212', 2, 'B', 12),
+  (40005, '20160212', 3, 'A', 10),
+  (20002, '20160216', 1, 'C', 20),
+  (30003, '20160418', 2, 'B', 15),
+  (30004, '20140418', 3, 'C', 22),
+  (30007, '20160907', 3, 'D', 30);
+
+SELECT * FROM dbo.Orders;
+
+-- Query against Orders, grouping by employee and customer
+SELECT empid, custid, SUM(qty) AS sumqty
+FROM dbo.Orders
+GROUP BY empid, custid;
+
+---------------------------------------------------------------------
+-- Pivoting with a Grouped Query
+---------------------------------------------------------------------
+
+-- Query against Orders, grouping by employee, pivoting customers,
+-- aggregating sum of quantity
+SELECT empid,
+  SUM(CASE WHEN custid = 'A' THEN qty END) AS A,
+  SUM(CASE WHEN custid = 'B' THEN qty END) AS B,
+  SUM(CASE WHEN custid = 'C' THEN qty END) AS C,
+  SUM(CASE WHEN custid = 'D' THEN qty END) AS D  
+FROM dbo.Orders
+GROUP BY empid;
+
+---------------------------------------------------------------------
+-- Pivoting with the PIVOT Operator
+---------------------------------------------------------------------
+
+-- Logical equivalent of previous query using the native PIVOT operator
+SELECT empid, A, B, C, D
+FROM (SELECT empid, custid, qty
+      FROM dbo.Orders) AS D
+  PIVOT(SUM(qty) FOR custid IN(A, B, C, D)) AS P;
+
+-- Query demonstrating the problem with implicit grouping
+SELECT empid, A, B, C, D
+FROM dbo.Orders
+  PIVOT(SUM(qty) FOR custid IN(A, B, C, D)) AS P;
+
+-- Logical equivalent of previous query
+SELECT empid,
+  SUM(CASE WHEN custid = 'A' THEN qty END) AS A,
+  SUM(CASE WHEN custid = 'B' THEN qty END) AS B,
+  SUM(CASE WHEN custid = 'C' THEN qty END) AS C,
+  SUM(CASE WHEN custid = 'D' THEN qty END) AS D  
+FROM dbo.Orders
+GROUP BY orderid, orderdate, empid;
+
+-- Query against Orders, grouping by customer, pivoting employees,
+-- aggregating sum of quantity
+SELECT custid, [1], [2], [3]
+FROM (SELECT empid, custid, qty
+      FROM dbo.Orders) AS D
+  PIVOT(SUM(qty) FOR empid IN([1], [2], [3])) AS P;
+
+---------------------------------------------------------------------
+-- Unpivoting Data
+---------------------------------------------------------------------
+
+-- Code to create and populate the EmpCustOrders table
+USE TSQLV4;
+
+DROP TABLE IF EXISTS dbo.EmpCustOrders;
+
+CREATE TABLE dbo.EmpCustOrders
+(
+  empid INT NOT NULL
+    CONSTRAINT PK_EmpCustOrders PRIMARY KEY,
+  A VARCHAR(5) NULL,
+  B VARCHAR(5) NULL,
+  C VARCHAR(5) NULL,
+  D VARCHAR(5) NULL
+);
+
+INSERT INTO dbo.EmpCustOrders(empid, A, B, C, D)
+  SELECT empid, A, B, C, D
+  FROM (SELECT empid, custid, qty
+        FROM dbo.Orders) AS D
+    PIVOT(SUM(qty) FOR custid IN(A, B, C, D)) AS P;
+
+SELECT * FROM dbo.EmpCustOrders;
+
+---------------------------------------------------------------------
+-- Unpivoting with the APPLY Operator
+---------------------------------------------------------------------
+
+-- Unpivot Step 1: generate copies
+SELECT *
+FROM dbo.EmpCustOrders
+  CROSS JOIN (VALUES('A'),('B'),('C'),('D')) AS C(custid);
+
+-- Unpivot Step 2: extract elements
+/*
+SELECT empid, custid, qty
+FROM dbo.EmpCustOrders
+  CROSS JOIN (VALUES('A', A),('B', B),('C', C),('D', D)) AS C(custid, qty);
+*/
+
+SELECT empid, custid, qty
+FROM dbo.EmpCustOrders
+  CROSS APPLY (VALUES('A', A),('B', B),('C', C),('D', D)) AS C(custid, qty);
+
+-- Unpivot Step 3: eliminate NULLs
+SELECT empid, custid, qty
+FROM dbo.EmpCustOrders
+  CROSS APPLY (VALUES('A', A),('B', B),('C', C),('D', D)) AS C(custid, qty)
+WHERE qty IS NOT NULL;
+
+---------------------------------------------------------------------
+-- Unpivoting with the UNPIVOT Operator
+---------------------------------------------------------------------
+
+-- Query using the native UNPIVOT operator
+SELECT empid, custid, qty
+FROM dbo.EmpCustOrders
+  UNPIVOT(qty FOR custid IN(A, B, C, D)) AS U;
+  
+---------------------------------------------------------------------
+-- Grouping Sets
+---------------------------------------------------------------------
+
+-- Four queries, each with a different grouping set
+SELECT empid, custid, SUM(qty) AS sumqty
+FROM dbo.Orders
+GROUP BY empid, custid;
+
+SELECT empid, SUM(qty) AS sumqty
+FROM dbo.Orders
+GROUP BY empid;
+
+SELECT custid, SUM(qty) AS sumqty
+FROM dbo.Orders
+GROUP BY custid;
+
+SELECT SUM(qty) AS sumqty
+FROM dbo.Orders;
+
+-- Unifying result sets of four queries
+SELECT empid, custid, SUM(qty) AS sumqty
+FROM dbo.Orders
+GROUP BY empid, custid
+
+UNION ALL
+
+SELECT empid, NULL, SUM(qty) AS sumqty
+FROM dbo.Orders
+GROUP BY empid
+
+UNION ALL
+
+SELECT NULL, custid, SUM(qty) AS sumqty
+FROM dbo.Orders
+GROUP BY custid
+
+UNION ALL
+
+SELECT NULL, NULL, SUM(qty) AS sumqty
+FROM dbo.Orders;
+
+---------------------------------------------------------------------
+-- GROUPING SETS Subclause
+---------------------------------------------------------------------
+
+-- Using the GROUPING SETS subclause
+SELECT empid, custid, SUM(qty) AS sumqty
+FROM dbo.Orders
+GROUP BY
+  GROUPING SETS
+  (
+    (empid, custid),
+    (empid),
+    (custid),
+    ()
+  );
+
+---------------------------------------------------------------------
+-- CUBE Subclause
+---------------------------------------------------------------------
+
+-- Using the CUBE subclause
+SELECT empid, custid, SUM(qty) AS sumqty
+FROM dbo.Orders
+GROUP BY CUBE(empid, custid);
+
+---------------------------------------------------------------------
+-- ROLLUP Subclause
+---------------------------------------------------------------------
+
+-- Using the ROLLUP subclause
+SELECT 
+  YEAR(orderdate) AS orderyear,
+  MONTH(orderdate) AS ordermonth,
+  DAY(orderdate) AS orderday,
+  SUM(qty) AS sumqty
+FROM dbo.Orders
+GROUP BY ROLLUP(YEAR(orderdate), MONTH(orderdate), DAY(orderdate));
+
+---------------------------------------------------------------------
+-- GROUPING and GROUPING_ID Function
+---------------------------------------------------------------------
+
+SELECT empid, custid, SUM(qty) AS sumqty
+FROM dbo.Orders
+GROUP BY CUBE(empid, custid);
+
+SELECT
+  GROUPING(empid) AS grpemp,
+  GROUPING(custid) AS grpcust,
+  empid, custid, SUM(qty) AS sumqty
+FROM dbo.Orders
+GROUP BY CUBE(empid, custid);
+
+SELECT
+  GROUPING_ID(empid, custid) AS groupingset,
+  empid, custid, SUM(qty) AS sumqty
+FROM dbo.Orders
+GROUP BY CUBE(empid, custid);
+
+---------------------------------------------------------------------
+-- Recursive CTEs
+---------------------------------------------------------------------
+
+WITH EmpsCTE AS
+(
+  SELECT empid, mgrid, firstname, lastname
+  FROM HR.Employees
+  WHERE empid = 2
+  
+  UNION ALL
+  
+  SELECT C.empid, C.mgrid, C.firstname, C.lastname
+  FROM EmpsCTE AS P
+    JOIN HR.Employees AS C
+      ON C.mgrid = P.empid
+)
+SELECT empid, mgrid, firstname, lastname
+FROM EmpsCTE;
+
+----------------------------------------------------------------------
+-- T-SQL Tips and Tricks
+-- © Itzik Ben-Gan, SolidQ
+-- Advanced T-SQL training: http://tsql.solidq.com
+---------------------------------------------------------------------
+
+-- TSQLV4 database: http://tsql.solidq.com/SampleDatabases/TSQLV4.zip
+-- PerformanceV3 database: http://tsql.solidq.com/SampleDatabases/PerformanceV3.zip
+
+----------------------------------------------------------------------
+-- Unusual search arguments
+----------------------------------------------------------------------
+
+USE TSQLV4;
+
+-- Example with filter
+CREATE INDEX idx_region ON Sales.Customers(region)
+  INCLUDE(custid, country, city);
+
+-- Not a SARG
+DECLARE @region AS NVARCHAR(40) = NULL;
+
+SELECT custid, country, region, city
+FROM Sales.Customers
+WHERE ISNULL(region, N'<N/A>') = ISNULL(@region, N'<N/A>');
+GO
+
+-- Awkward SARG
+DECLARE @region AS NVARCHAR(40) = NULL;
+
+SELECT custid, country, region, city
+FROM Sales.Customers
+WHERE region = @region OR (region IS NULL AND @region IS NULL);
+GO
+
+-- Elegant SARG
+DECLARE @region AS NVARCHAR(40) = NULL;
+
+SELECT custid, country, region, city
+FROM Sales.Customers
+WHERE EXISTS (SELECT region INTERSECT SELECT @region);
+GO
+
+-- Cleanup
+DROP INDEX idx_region ON Sales.Customers;
+
+-- Example with join
+DROP TABLE IF EXISTS dbo.CustLocations, dbo.EmpLocations;
+
+SELECT country, region, city, COUNT(*) AS numcusts
+INTO dbo.CustLocations
+FROM Sales.Customers
+GROUP BY country, region, city;
+
+CREATE UNIQUE CLUSTERED INDEX idx_location ON dbo.CustLocations(country, region, city);
+
+SELECT country, region, city, COUNT(*) AS numemps
+INTO dbo.EmpLocations
+FROM HR.Employees
+GROUP BY country, region, city;
+
+CREATE UNIQUE CLUSTERED INDEX idx_location ON dbo.EmpLocations(country, region, city);
+
+-- Query with join, missing NULLs
+SELECT C.country, C.region, C.city, C.numcusts, E.numemps
+FROM dbo.CustLocations AS C
+  INNER JOIN dbo.EmpLocations AS E
+    ON C.country = E.country
+    AND C.region = E.region
+    AND C.city = E.city
+OPTION (MERGE JOIN);
+
+-- Query with ISNULL
+SELECT C.country, C.region, C.city, C.numcusts, E.numemps
+FROM dbo.CustLocations AS C
+  INNER JOIN dbo.EmpLocations AS E
+    ON C.country = E.country
+    AND ISNULL(C.region, N'<N/A>') = ISNULL(E.region, N'<N/A>')
+    AND C.city = E.city
+OPTION (MERGE JOIN);
+
+-- Query with awkward predicate
+SELECT C.country, C.region, C.city, C.numcusts, E.numemps
+FROM dbo.CustLocations AS C
+  INNER JOIN dbo.EmpLocations AS E
+    ON C.country = E.country
+    AND (C.region = E.region OR C.region IS NULL AND E.region IS NULL)
+    AND C.city = E.city
+OPTION (MERGE JOIN);
+
+-- Query with elegant predicate
+SELECT C.country, C.region, C.city, C.numcusts, E.numemps
+FROM dbo.CustLocations AS C
+  INNER JOIN dbo.EmpLocations AS E
+    ON EXISTS(SELECT C.country, C.region, C.city INTERSECT SELECT E.country, E.region, E.city)
+OPTION (MERGE JOIN);
+
+----------------------------------------------------------------------
+-- Batch processing with empty columnstore
+----------------------------------------------------------------------
+
+-- testwindow database
+SET NOCOUNT ON;
+IF DB_ID(N'testwindow') IS NULL CREATE DATABASE testwindow;
+GO
+USE testwindow;
+GO
+
+-- GetNums helper function
+DROP FUNCTION IF EXISTS dbo.GetNums;
+GO
+
+CREATE FUNCTION dbo.GetNums(@low AS BIGINT, @high AS BIGINT) RETURNS TABLE
+AS
+RETURN
+  WITH
+    L0   AS (SELECT c FROM (SELECT 1 UNION ALL SELECT 1) AS D(c)),
+    L1   AS (SELECT 1 AS c FROM L0 AS A CROSS JOIN L0 AS B),
+    L2   AS (SELECT 1 AS c FROM L1 AS A CROSS JOIN L1 AS B),
+    L3   AS (SELECT 1 AS c FROM L2 AS A CROSS JOIN L2 AS B),
+    L4   AS (SELECT 1 AS c FROM L3 AS A CROSS JOIN L3 AS B),
+    L5   AS (SELECT 1 AS c FROM L4 AS A CROSS JOIN L4 AS B),
+    Nums AS (SELECT ROW_NUMBER() OVER(ORDER BY (SELECT NULL)) AS rownum
+             FROM L5)
+  SELECT TOP(@high - @low + 1) @low + rownum - 1 AS n
+  FROM Nums
+  ORDER BY rownum;
+GO
+
+-- Transactions table with 10M rows (200 accounts x 50000 transactions per act)
+-- Traditional rowstore B-tree index
+DROP TABLE IF EXISTS dbo.Transactions;
+
+CREATE TABLE dbo.Transactions
+(
+  actid  INT   NOT NULL,
+  tranid INT   NOT NULL,
+  val    MONEY NOT NULL,
+  CONSTRAINT PK_Transactions PRIMARY KEY(actid, tranid)
+);
+GO
+
+DECLARE
+  @num_partitions     AS INT = 200,
+  @rows_per_partition AS INT = 50000;
+
+INSERT INTO dbo.Transactions WITH (TABLOCK) (actid, tranid, val)
+  SELECT NP.n, RPP.n,
+    (ABS(CHECKSUM(NEWID())%2)*2-1) * (1 + ABS(CHECKSUM(NEWID())%5))
+  FROM dbo.GetNums(1, @num_partitions) AS NP
+    CROSS JOIN dbo.GetNums(1, @rows_per_partition) AS RPP;
+GO
+
+-- TransactionsCS
+-- Clustered columnstore index
+DROP TABLE IF EXISTS dbo.TransactionsCS;
+SELECT * INTO dbo.TransactionsCS FROM dbo.Transactions;
+CREATE CLUSTERED COLUMNSTORE INDEX idx_cs ON dbo.TransactionsCS;
+GO
+
+-- TransactionsDCS
+-- Traditional rowstore B-tree index
+--   + dummy empty filtered nonclustered columnstore index to enable using batch mode operators
+DROP TABLE IF EXISTS dbo.TransactionsDCS;
+SELECT * INTO dbo.TransactionsDCS FROM dbo.Transactions;
+ALTER TABLE dbo.TransactionsDCS
+  ADD CONSTRAINT PK_TransactionsDCS PRIMARY KEY(actid, tranid);
+CREATE NONCLUSTERED COLUMNSTORE INDEX idx_cs_dummy ON dbo.TransactionsDCS(actid)
+  WHERE actid = -1 AND actid = -2;
+GO
+
+-- Running total without window function
+SELECT T1.actid, T1.tranid, T1.val, SUM(T2.val) AS balance
+FROM dbo.Transactions AS T1
+  INNER JOIN dbo.Transactions AS T2
+    ON T2.actid = T1.actid
+       AND T2.tranid <= T1.tranid
+GROUP BY T1.actid, T1.tranid, T1.val;
+
+-- Running total with ROWS in row mode
+SELECT actid, tranid, val,
+  SUM(val) OVER(PARTITION BY actid ORDER BY tranid
+                ROWS UNBOUNDED PRECEDING) AS balance
+FROM dbo.Transactions;
+
+-- Running total with RANGE in row mode
+SELECT actid, tranid, val,
+  SUM(val) OVER(PARTITION BY actid ORDER BY tranid) AS balance
+FROM dbo.Transactions;
+
+-- Enabling batch mode with empty filtered columnstore index
+CREATE NONCLUSTERED COLUMNSTORE INDEX idx_cs_dummy ON dbo.TransactionsDCS(actid)
+  WHERE actid = -1 AND actid = -2;
+
+-- Running total with ROWS in row mode
+SELECT actid, tranid, val,
+  SUM(val) OVER(PARTITION BY actid ORDER BY tranid
+                ROWS UNBOUNDED PRECEDING) AS balance
+FROM dbo.TransactionsDCS;
+
+-- Running total with RANGE in row mode
+SELECT actid, tranid, val,
+  SUM(val) OVER(PARTITION BY actid ORDER BY tranid) AS balance
+FROM dbo.TransactionsDCS;
+
+----------------------------------------------------------------------
+-- String splitting
+----------------------------------------------------------------------
+
+USE TSQLV4;
+GO
+
+-- pre-2016 with a T-SQL solution
+IF OBJECT_ID('dbo.GetOrders') IS NOT NULL DROP PROC dbo.GetOrders;
+IF OBJECT_ID('dbo.StringSplit') IS NOT NULL DROP FUNCTION dbo.StringSplit;
+GO
+
+CREATE FUNCTION dbo.StringSplit
+  (@arr AS VARCHAR(8000), @sep AS CHAR(1) = ',')
+RETURNS TABLE
+AS
+RETURN
+  SELECT SUBSTRING(@arr, n, CHARINDEX(@sep, @arr + @sep, n) - n) AS val
+  FROM dbo.Nums
+  WHERE n <= LEN(@arr) + 1
+    AND SUBSTRING(@sep + @arr, n, 1) = @sep;
+GO
+
+CREATE PROC dbo.GetOrders(@orderids AS VARCHAR(8000))
+AS
+
+SELECT O.orderid, O.orderdate, O.custid, O.empid
+FROM Sales.Orders AS O
+  INNER JOIN dbo.StringSplit(@orderids, ',') AS K
+    ON O.orderid = CAST(K.val AS INT);
+GO
+   
+EXEC dbo.GetOrders @orderids = '10248,10249,10250';
+GO
+
+-- 2016+
+CREATE OR ALTER PROC dbo.GetOrders(@orderids AS VARCHAR(8000))
+AS
+
+SELECT O.orderid, O.orderdate, O.custid, O.empid
+FROM Sales.Orders AS O
+  INNER JOIN STRING_SPLIT(@orderids, ',') AS K
+    ON O.orderid = CAST(K.value AS INT);
+GO
+   
+EXEC dbo.GetOrders @orderids = '10248,10249,10250';
+GO
+
+----------------------------------------------------------------------
+-- String aggregation
+----------------------------------------------------------------------
+
+-- aggregate order IDs for a given customer
+DECLARE @custid AS INT = 1;
+
+SELECT
+  STUFF(
+    (SELECT ',' + CAST(orderid AS VARCHAR(10)) AS [text()]
+     FROM Sales.Orders
+     WHERE custid = @custid
+     ORDER BY orderdate DESC, orderid DESC
+     FOR XML PATH('')), 1, 1, NULL);
+     
+-- aggregate order IDs per customer using pre-2016 solution
+SELECT C.custid,
+  STUFF(
+    (SELECT ',' + CAST(orderid AS VARCHAR(10)) AS [text()]
+     FROM Sales.Orders AS O
+     WHERE O.custid = C.custid
+     ORDER BY orderdate DESC, orderid DESC
+     FOR XML PATH('')), 1, 1, NULL) AS orderids
+--     FOR XML PATH(''), TYPE).value('.[1]', 'VARCHAR(MAX)'), 1, 1, NULL) AS orderids
+FROM Sales.Customers AS C;
+
+-- vNext
+CREATE UNIQUE INDEX idx_cid_odD_oidD ON Sales.Orders(custid, orderdate DESC, orderid DESC);
+
+SELECT custid,
+  STRING_AGG(CAST(orderid AS VARCHAR(10)), ',')
+    WITHIN GROUP(ORDER BY orderdate DESC, orderid DESC) AS orderids
+FROM Sales.Orders
+GROUP BY custid;
+
+DROP INDEX idx_cid_odD_oidD ON Sales.Orders;
+GO
+
+----------------------------------------------------------------------
+-- Last non NULL
+----------------------------------------------------------------------
+
+-- Sample data
+SET NOCOUNT ON;
+DROP TABLE IF EXISTS dbo.T1;
+GO
+CREATE TABLE dbo.T1
+(
+  id INT NOT NULL CONSTRAINT PK_T1 PRIMARY KEY,
+  col1 INT NULL
+);
+
+-- Small set of sample data
+TRUNCATE TABLE dbo.T1;
+
+INSERT INTO dbo.T1(id, col1) VALUES
+  ( 2, NULL),
+  ( 3,   10),
+  ( 5,   -1),
+  ( 7, NULL),
+  (11, NULL),
+  (13,  -12),
+  (17, NULL),
+  (19, NULL),
+  (23, 1759);
+GO
+
+-- Large set of sample data
+TRUNCATE TABLE dbo.T1;
+
+INSERT INTO dbo.T1 WITH(TABLOCK)
+  SELECT n AS id, CHECKSUM(NEWID()) AS col1
+  FROM TSQLV3.dbo.GetNums(1, 10000000) AS Nums
+OPTION(MAXDOP 1);
+
+-- Solution based on running aggregates
+WITH C AS
+(
+  SELECT id, col1,
+    MAX(CASE WHEN col1 IS NOT NULL THEN id END)
+      OVER(ORDER BY id
+           ROWS UNBOUNDED PRECEDING) AS grp
+  FROM dbo.T1
+)
+SELECT id, col1,
+  MAX(col1) OVER(PARTITION BY grp 
+                 ORDER BY id 
+                 ROWS UNBOUNDED PRECEDING) AS lastnonnull
+FROM C;
+
+-- Alternative
+SELECT id, col1,
+  CAST(
+    SUBSTRING(
+      MAX( CAST(id AS BINARY(4)) + CAST(col1 AS BINARY(4)) )
+        OVER( ORDER BY id
+              ROWS UNBOUNDED PRECEDING ),
+      5, 4)
+    AS INT) AS lastval
+FROM dbo.T1;
+
+----------------------------------------------------------------------
+-- Join reordering
+----------------------------------------------------------------------
+
+-- multi-join query
+SELECT DISTINCT C.companyname AS customer, S.companyname AS supplier
+FROM Sales.Customers AS C
+  INNER JOIN Sales.Orders AS O
+    ON O.custid = C.custid
+  INNER JOIN Sales.OrderDetails AS OD
+    ON OD.orderid = O.orderid
+  INNER JOIN Production.Products AS P
+    ON P.productid = OD.productid
+  INNER JOIN Production.Suppliers AS S
+    ON S.supplierid = P.supplierid;
+
+-- change logical ordering
+SELECT DISTINCT C.companyname AS customer, S.companyname AS supplier
+FROM Sales.Customers AS C
+  LEFT OUTER JOIN Sales.Orders AS O
+  INNER JOIN Sales.OrderDetails AS OD
+    ON OD.orderid = O.orderid
+  INNER JOIN Production.Products AS P
+    ON P.productid = OD.productid
+  INNER JOIN Production.Suppliers AS S
+    ON S.supplierid = P.supplierid
+    ON O.custid = C.custid;
+
+-- with parentheses and indentation for clarity 
+SELECT DISTINCT C.companyname AS customer, S.companyname AS supplier
+FROM Sales.Customers AS C
+  LEFT OUTER JOIN 
+    ( Sales.Orders AS O
+        INNER JOIN Sales.OrderDetails AS OD
+          ON OD.orderid = O.orderid
+        INNER JOIN Production.Products AS P
+          ON P.productid = OD.productid
+        INNER JOIN Production.Suppliers AS S
+          ON S.supplierid = P.supplierid )
+      ON O.custid = C.custid;
+
+----------------------------------------------------------------------
+-- AT TIME ZONE
+----------------------------------------------------------------------
+
+---------------------------------------------------------------------
+-- AT TIME ZONE
+---------------------------------------------------------------------
+
+-- Get time zone info
+SELECT name, current_utc_offset, is_currently_dst
+FROM sys.time_zone_info;
+
+-- Converting non-datetimeoffset values
+-- behavior similar to TODATETIMEOFFSET
+SELECT
+  CAST('20160212 12:00:00.0000000' AS DATETIME2)
+    AT TIME ZONE 'Pacific Standard Time' AS val1,
+  CAST('20160812 12:00:00.0000000' AS DATETIME2)
+    AT TIME ZONE 'Pacific Standard Time' AS val2;
+
+-- Converting datetimeoffset values
+-- behavior similar to SWITCHOFFSET
+SELECT
+  CAST('20160212 12:00:00.0000000 -05:00' AS DATETIMEOFFSET)
+    AT TIME ZONE 'Pacific Standard Time' AS val1,
+  CAST('20160812 12:00:00.0000000 -04:00' AS DATETIMEOFFSET)
+    AT TIME ZONE 'Pacific Standard Time' AS val2;
+	
+---------------------------------------------------------------------
+-- This batch-mode Window Aggregate operator will change your life!
+-- © Itzik Ben-Gan, SolidQ
+-- For more, see 5-day Advanced T-SQL Course:
+-- http://tsql.solidq.com/
+---------------------------------------------------------------------
+
+---------------------------------------------------------------------
+-- Sample data
+---------------------------------------------------------------------
+
+-- testwindow database
+SET NOCOUNT ON;
+IF DB_ID(N'testwindow') IS NULL CREATE DATABASE testwindow;
+GO
+USE testwindow;
+GO
+
+-- GetNums helper function
+DROP FUNCTION IF EXISTS dbo.GetNums;
+GO
+
+CREATE FUNCTION dbo.GetNums(@low AS BIGINT, @high AS BIGINT) RETURNS TABLE
+AS
+RETURN
+  WITH
+    L0   AS (SELECT c FROM (SELECT 1 UNION ALL SELECT 1) AS D(c)),
+    L1   AS (SELECT 1 AS c FROM L0 AS A CROSS JOIN L0 AS B),
+    L2   AS (SELECT 1 AS c FROM L1 AS A CROSS JOIN L1 AS B),
+    L3   AS (SELECT 1 AS c FROM L2 AS A CROSS JOIN L2 AS B),
+    L4   AS (SELECT 1 AS c FROM L3 AS A CROSS JOIN L3 AS B),
+    L5   AS (SELECT 1 AS c FROM L4 AS A CROSS JOIN L4 AS B),
+    Nums AS (SELECT ROW_NUMBER() OVER(ORDER BY (SELECT NULL)) AS rownum
+             FROM L5)
+  SELECT TOP(@high - @low + 1) @low + rownum - 1 AS n
+  FROM Nums
+  ORDER BY rownum;
+GO
+
+-- Transactions table with 10M rows (200 accounts x 50000 transactions per act)
+-- Traditional rowstore B-tree index
+DROP TABLE IF EXISTS dbo.Transactions;
+
+CREATE TABLE dbo.Transactions
+(
+  actid  INT   NOT NULL,
+  tranid INT   NOT NULL,
+  val    MONEY NOT NULL,
+  CONSTRAINT PK_Transactions PRIMARY KEY(actid, tranid)
+);
+GO
+
+DECLARE
+  @num_partitions     AS INT = 200,
+  @rows_per_partition AS INT = 50000;
+
+INSERT INTO dbo.Transactions WITH (TABLOCK) (actid, tranid, val)
+  SELECT NP.n, RPP.n,
+    (ABS(CHECKSUM(NEWID())%2)*2-1) * (1 + ABS(CHECKSUM(NEWID())%5))
+  FROM dbo.GetNums(1, @num_partitions) AS NP
+    CROSS JOIN dbo.GetNums(1, @rows_per_partition) AS RPP;
+GO
+
+-- TransactionsCS
+-- Clustered columnstore index
+DROP TABLE IF EXISTS dbo.TransactionsCS;
+SELECT * INTO dbo.TransactionsCS FROM dbo.Transactions;
+CREATE CLUSTERED COLUMNSTORE INDEX idx_cs ON dbo.TransactionsCS;
+GO
+
+-- TransactionsDCS
+-- Traditional rowstore B-tree index
+--   + dummy empty filtered nonclustered columnstore index to enable using batch mode operators
+DROP TABLE IF EXISTS dbo.TransactionsDCS;
+SELECT * INTO dbo.TransactionsDCS FROM dbo.Transactions;
+ALTER TABLE dbo.TransactionsDCS
+  ADD CONSTRAINT PK_TransactionsDCS PRIMARY KEY(actid, tranid);
+CREATE NONCLUSTERED COLUMNSTORE INDEX idx_cs_dummy ON dbo.TransactionsDCS(actid)
+  WHERE actid = -1 AND actid = -2;
+GO
+
+---------------------------------------------------------------------
+-- Frameless aggregate window functions
+---------------------------------------------------------------------
+
+-- Query 1, row mode over rowstore
+-- Plan in Figure 2, parallel, Table Spool, no sort, row mode
+-- duration: 47 sec, CPU: 57 sec, logical reads: 20M, writes: 40K
+SELECT actid, tranid, val,
+  SUM(val) OVER(PARTITION BY actid) AS acttotal
+FROM dbo.Transactions;
+
+-- If data wasn't ordered in an index, would require a sort (row mode)
+
+-- Query 2, batch mode over columnstore
+-- Plan in Figure 3, parallel, no spool, sort, most operators use batch mode
+-- duration: 7 sec, CPU: 13 sec, logical reads: 6k, writes: 0
+SELECT actid, tranid, val,
+  SUM(val) OVER(PARTITION BY actid) AS acttotal
+FROM dbo.TransactionsCS;
+
+-- Query 3, batch mode over rowstore (by having a dummy columnstore index)
+-- Plan in Figure 4, serial, no spool, no sort, Index Scan uses row mode, all other operators use batch mode
+-- duration: 7 sec, CPU: 7 sec, logical reads: 31k, writes: 0
+SELECT actid, tranid, val,
+  SUM(val) OVER(PARTITION BY actid) AS acttotal
+FROM dbo.TransactionsDCS;
+
+-- Force parallel plan for troubleshooting purposes
+-- Plan in Figure 5 is parallel, uses an Ordered: False scan and a Sort operator
+SELECT actid, tranid, val,
+  SUM(val) OVER(PARTITION BY actid) AS acttotal
+FROM dbo.TransactionsDCS
+OPTION (QUERYTRACEON 8649);
+
+---------------------------------------------------------------------
+-- Ranking window functions
+---------------------------------------------------------------------
+
+-- Row mode, when index exists already very optimized
+-- Query 1, row mode over rowstore, no sort
+-- Plan in Figure 1, serial, no spool, no sort, row mode
+-- duration: 12 sec, CPU: 12 sec, logical reads: 31K, writes: 0
+SELECT actid, tranid, val,
+  ROW_NUMBER() OVER(PARTITION BY actid ORDER BY tranid) AS rownum,
+  RANK() OVER(PARTITION BY actid ORDER BY tranid) AS rnk,
+  DENSE_RANK() OVER(PARTITION BY actid ORDER BY tranid) AS drnk
+FROM dbo.Transactions;
+
+-- Row mode, when index does not exist, slow because of sort
+-- Query 2, row mode over rowstore, with sort
+-- Plan in Figure 2, scan and sort parallel, window functions calculation serial, no spool, sort, row mode
+-- duration: 28 sec, CPU: 53 sec, logical reads: 53K, writes: 13
+SELECT actid, tranid, val,
+  ROW_NUMBER() OVER(PARTITION BY actid ORDER BY val) AS rownum,
+  RANK() OVER(PARTITION BY actid ORDER BY val) AS rnk,
+  DENSE_RANK() OVER(PARTITION BY actid ORDER BY val) AS drnk
+FROM dbo.Transactions;
+
+-- In batch mode, needs sort, but much faster
+-- Query 3, batch mode over columnstore
+-- Plan in Figure 3, parallel, no spool, sort, batch mode
+-- duration: 10 sec, CPU: 23 sec, logical reads: 6K, writes: 0
+SELECT actid, tranid, val,
+  ROW_NUMBER() OVER(PARTITION BY actid ORDER BY tranid) AS rownum,
+  RANK() OVER(PARTITION BY actid ORDER BY tranid) AS rnk,
+  DENSE_RANK() OVER(PARTITION BY actid ORDER BY tranid) AS drnk
+FROM dbo.TransactionsCS;
+
+-- NTILE is slow in row mode due to use of disk spool
+-- Query 7, row mode over rowstore
+-- Plan in Figure 6, serial, Table Spool, no sort, row mode
+-- duration: 47 sec, CPU: 47 sec, logical reads: 20M, writes: 40K
+-- With sort (ORDER BY val) duration is 57 sec
+SELECT actid, tranid, val,
+  NTILE(10) OVER(PARTITION BY actid ORDER BY tranid) AS ntile10
+FROM dbo.Transactions;
+
+-- Fast in batch mode even when sort is needed
+-- Query 8, batch mode over columnstore
+-- Plan in Figure 7, count parallel / segment + sequence project serial, no spool, sort, count batch mode / segment + sequence project row mode
+-- duration: 14 sec, CPU: 23 sec, logical reads: 6K, writes: 0
+SELECT actid, tranid, val,
+  NTILE(10) OVER(PARTITION BY actid ORDER BY tranid) AS ntile10
+FROM dbo.TransactionsCS;
+
+-- Faster in batch mode over rowstore when no need for sort
+-- Query 9, batch mode over rowstore, no sort
+-- Plan in Figure 8, serial, no spool, no sort, index scan row mode, rest batch mode
+-- duration: 8 sec, CPU: 8 sec, logical reads: 31K, writes: 0
+SELECT actid, tranid, val,
+  NTILE(10) OVER(PARTITION BY actid ORDER BY tranid) AS ntile10
+FROM dbo.TransactionsDCS;
+
+---------------------------------------------------------------------
+-- Statistical window functions
+---------------------------------------------------------------------
+
+---------------------------------------------------------------------
+-- PERCENTILE_CONT (PERCENTILE_DISC has similar optimization)
+---------------------------------------------------------------------
+
+-- Query 11, row mode over rowstore, no sort
+-- Two rounds of writing to and reading from an on-disk spool
+-- duration: 110 sec, CPU: 121 sec, logical reads: 41M, writes: 101K
+-- If you change to ORDER BY val, will require a sort
+SELECT actid, tranid, val,
+  PERCENTILE_CONT(0.5)
+    WITHIN GROUP(ORDER BY tranid) OVER(PARTITION BY actid) AS mediantid
+FROM dbo.Transactions;
+
+-- Optimized method with CROSS APPLY and OFFSET FETCH
+WITH C AS
+(
+  SELECT actid, 
+    (COUNT(*) - 1) / 2 AS ov,
+    2 - COUNT(*) % 2 AS fv
+  FROM dbo.Transactions
+  GROUP BY actid
+)
+SELECT C.actid, AVG(A.val) AS median
+FROM C
+  CROSS APPLY (SELECT T.val
+               FROM dbo.Transactions AS T
+               WHERE T.actid = C.actid
+               ORDER BY T.actid
+               OFFSET C.ov ROWS FETCH NEXT C.fv ROWS ONLY) AS A
+GROUP BY C.actid;
+
+-- Query 12, batch mode over columnstore, sort, no spool
+-- duration: 14 sec, CPU: 13 sec, logical reads: 5K, writes: 0
+SELECT actid, tranid, val,
+  PERCENTILE_CONT(0.5)
+    WITHIN GROUP(ORDER BY tranid) OVER(PARTITION BY actid) AS mediantid
+FROM dbo.TransactionsCS;
+
+-- Query 13, batch mode over rowstore, no sort, no spool
+-- duration: 11 sec, CPU: 11 sec, logical reads: 31K, writes: 0
+SELECT actid, tranid, val,
+  PERCENTILE_CONT(0.5)
+    WITHIN GROUP(ORDER BY tranid) OVER(PARTITION BY actid) AS mediantid
+FROM dbo.TransactionsDCS;
+
+---------------------------------------------------------------------
+-- PERCENT_RANK and CUME_DIST
+---------------------------------------------------------------------
+
+-- Query 14, row mode over rowstore, no sort, on-disk spool
+-- duration: 54 sec, CPU: 53 sec, logical reads: 20M, writes: 40K
+SELECT actid, tranid, val,
+  PERCENT_RANK() OVER(PARTITION BY actid ORDER BY tranid) AS pctrk
+FROM dbo.Transactions;
+
+-- Query 15, row mode over rowstore, no sort, on-disk spool
+-- duration: 239 sec, CPU: 250 sec, logical reads: 125M, writes: 82K
+SELECT actid, tranid, val,
+  CUME_DIST() OVER(PARTITION BY actid ORDER BY tranid) AS cumedist
+FROM dbo.Transactions;
+
+-- Query 16, batch mode over columnstore, sort, no spool
+-- duration: 17 sec, CPU: 17 sec, logical reads: 6K, writes: 0K
+SELECT actid, tranid, val,
+  PERCENT_RANK() OVER(PARTITION BY actid ORDER BY tranid) AS pctrk
+FROM dbo.TransactionsCS;
+
+-- Query 17, batch mode over columnstore, sort, no spool
+-- duration: 11 sec, CPU: 10 sec, logical reads: 6K, writes: 0K
+SELECT actid, tranid, val,
+  CUME_DIST() OVER(PARTITION BY actid ORDER BY tranid) AS cumedist
+FROM dbo.TransactionsCS;
+
+-- Query 18, batch mode over rowstore, no sort, no spool
+-- duration: 8 sec, CPU: 8 sec, logical reads: 31K, writes: 0K
+SELECT actid, tranid, val,
+  PERCENT_RANK() OVER(PARTITION BY actid ORDER BY tranid) AS pctrk
+FROM dbo.TransactionsDCS;
+
+-- Query 19, batch mode over rowstore, no sort, no spool
+-- duration: 8 sec, CPU: 8 sec, logical reads: 31K, writes: 0K
+SELECT actid, tranid, val,
+  CUME_DIST() OVER(PARTITION BY actid ORDER BY tranid) AS cumedist
+FROM dbo.TransactionsDCS;
+
+---------------------------------------------------------------------
+-- Aggregate window functions with a frame
+---------------------------------------------------------------------
+
+-- Can use the Window Aggregate operator when the delimiters are UNBOUNDED and CURRENT ROW
+
+-------------------------------------------------------------------------------------------
+-- ROWS with delimiters UNBOUNDED and CURRENT ROW
+-------------------------------------------------------------------------------------------
+
+-- Without window function
+SELECT T1.actid, T1.tranid, T1.val, SUM(T2.val) AS balance
+FROM dbo.Transactions AS T1
+  INNER JOIN dbo.Transactions AS T2
+    ON T2.actid = T1.actid
+       AND T2.tranid <= T1.tranid
+GROUP BY T1.actid, T1.tranid, T1.val;
+
+-- Query 1: row mode over rowstore
+-- Plan in Figure 1, serial, fast-track, Window Spool (in-memory), no sort, row mode
+-- duration: 28 sec, CPU: 28 sec, logical reads: 31K, writes: 0
+SELECT actid, tranid, val,
+  SUM(val) OVER(PARTITION BY actid ORDER BY tranid
+                ROWS UNBOUNDED PRECEDING) AS balance
+FROM dbo.Transactions;
+
+-- Query 2: batch mode over columnstore
+-- Plan in Figure 2, parallel, no spool, sort, most operators use batch mode
+-- duration: 8 sec, CPU: 19 sec, logical reads: 6k, writes: 0
+SELECT actid, tranid, val,
+  SUM(val) OVER(PARTITION BY actid ORDER BY tranid
+                ROWS UNBOUNDED PRECEDING) AS balance
+FROM dbo.TransactionsCS;
+
+-- Query 3: batch mode over rowstore
+-- Plan in Figure 3, serial, no spool, no sort
+-- duration: 7 sec, CPU: 7 sec, logical reads: 31k, writes: 0
+SELECT actid, tranid, val,
+  SUM(val) OVER(PARTITION BY actid ORDER BY tranid
+                ROWS UNBOUNDED PRECEDING) AS balance
+FROM dbo.TransactionsDCS;
+
+-------------------------------------------------------------------------------------------
+-- RANGE with delimiters UNBOUNDED and CURRENT ROW
+-------------------------------------------------------------------------------------------
+
+-- Query 4, row mode over rowstore
+-- Plan in Figure 4, serial, fast-track, Window Spool (on-disk), no sort, row mode
+-- duration: 221 sec, CPU: 204 sec, logical reads: 104M, writes: 31K
+SELECT actid, tranid, val,
+  SUM(val) OVER(PARTITION BY actid ORDER BY tranid
+                RANGE UNBOUNDED PRECEDING) AS balance
+FROM dbo.Transactions;
+
+-- Same as above since RANGE UNBOUNDED PRECEDING is the default
+SELECT actid, tranid, val,
+  SUM(val) OVER(PARTITION BY actid ORDER BY tranid) AS balance
+FROM dbo.Transactions;
+
+-- Query 5, batch mode over columnstore (similar to Query 2/Figure 2)
+-- duration: 9 sec, CPU: 21 sec, logical reads: 6k, writes: 0
+SELECT actid, tranid, val,
+  SUM(val) OVER(PARTITION BY actid ORDER BY tranid
+                RANGE UNBOUNDED PRECEDING) AS balance
+FROM dbo.TransactionsCS;
+
+-- Query 6, batch mode over row store (similar to Query 3/Figure 3)
+-- duration: 7 sec, CPU: 7 sec, logical reads: 31k, writes: 0
+SELECT actid, tranid, val,
+  SUM(val) OVER(PARTITION BY actid ORDER BY tranid
+                RANGE UNBOUNDED PRECEDING) AS balance
+FROM dbo.TransactionsDCS;
+
+-- Figure 5: Performance of aggregates with UNBOUNDED and CURRENT ROW
+
+-------------------------------------------------------------------------------------------
+-- Delimiters other than UNBOUNDED and CURRENT ROW
+-------------------------------------------------------------------------------------------
+
+-- If the delimiters are not UNBOUNDED and CURRENT ROW, there will be use of row mode operators, with some of the work possibly done with batch mode operators
+-- Can still use it to compute row numbers, and one of the aggregates (if fits the above pattern) in a two-part aggregate calculation
+
+-- Fast-track but not with CURRENT ROW
+-- Example: ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+-- Against Transactions (rowstore), similar to Query 1/Figure 1 since still fast-track
+-- Against TransactionsCS (columnstore), row number computed with Window Aggregate, but aggregate itself using fast-track row mode operators
+-- Against TransactionsDCS (rowstore + dummy columnstore), similar to Query 1/Figure 1; optimizer doesn't bother with batch mode here
+
+-- Not fast-track, but can be computed from two fast-track aggregates
+-- Example: ROWS BETWEEN 99 PRECEDING AND CURRENT ROW
+
+-- Against Transactions (rowstore), two fast-track aggregates, Window Spool (in-memory), no sort, row mode
+-- Query 5, row mode over rowstore
+-- Plan in Figure 6
+-- duration: 59 sec, CPU: 59 sec, logical reads: 31K, writes: 0
+SELECT actid, tranid, val,
+  SUM(val) OVER(PARTITION BY actid ORDER BY tranid
+                ROWS BETWEEN 99 PRECEDING AND CURRENT ROW) AS last100
+FROM dbo.Transactions;
+
+-- Against TransactionsCS (columnstore)
+-- CumulativeBottom aggregate and row number computed with Window Aggregate operators
+-- CumulativeTop aggregate computed with fast-track row mode operators
+-- duration: 34 sec, CPU: 34 sec, logical reads: 5k, writes: 0
+
+-- Against TransactionsDCS (rowstore + dummy columnstore)
+-- CumulativeBottom aggregate and row number computed with Window Aggregate operators
+-- CumulativeTop aggregate computed with fast-track row mode operators
+-- duration: 33 sec, CPU: 33 sec, logical reads: 5k, writes: 0
+
+-- Cumulative aggregate with frame like ROWS BETWEEN 99 PRECEDING AND 1 PRECEDING
+-- Transactions (rowstore): row number and two fast-track aggregates using row mode operators
+-- TransactionsCS (columnstore): row number computed with Window Aggregate operator, the two aggregates computed with fast-track row mode operators
+-- TransactionsDCS (rowstore + dummy columnstore): row number and two fast-track aggregates using row mode operators
+
+-- Noncumulative aggregate like MIN/MAX with frame like ROWS BETWEEN 99 PRECEDING AND 1 PRECEDING
+-- Has to write all rows to the frame
+-- Transactions (rowstore): row number and aggregate using row mode operators
+-- TransactionsCS (columnstore): row number computed with Window Aggregate operator, aggregate using row mode operators
+-- TransactionsDCS (rowstore + dummy columnstore): row number and aggregate using row mode operators
+
+---------------------------------------------------------------------
+-- Offset window functions
+---------------------------------------------------------------------
+
+---------------------------------------------------------------------
+-- LAG/LEAD
+---------------------------------------------------------------------
+
+-- Can use Window Aggregate operator when offset is 1.
+-- When more than 1, can only use Window Aggregate operator to compute row number;
+-- the rest of the work uses traditional row mode operators.
+
+-- Query 6, row mode over rowstore
+-- Plan in Figure 7 (similar to Query 1/Figure 1)
+-- duration: 33 sec, CPU: 32 sec, logical reads: 31K, writes: 0
+SELECT actid, tranid, val,
+  LAG(val) OVER(PARTITION BY actid ORDER BY tranid) AS prevval
+FROM dbo.Transactions;
+
+-- Query 7, identical plan to Query 6
+SELECT actid, tranid, val,
+  LAST_VALUE(val) OVER(PARTITION BY actid ORDER BY tranid
+                       ROWS BETWEEN 1 PRECEDING AND 1 PRECEDING) AS prevval
+FROM dbo.Transactions;
+
+-- Query 8, batch mode over columnstore
+-- Plan in Figure 8 (similar to Query 2/Figure 2)
+-- duration: 10 sec, CPU: 19 sec, logical reads: 6K, writes: 0
+SELECT actid, tranid, val,
+  LAG(val) OVER(PARTITION BY actid ORDER BY tranid) AS prevval
+FROM dbo.TransactionsCS;
+
+-- Query 9, batch mode over rowstore
+-- Plan in Figure 9 (similar to Query 3/Figure 3)
+-- duration: 7 sec, CPU: 7 sec, logical reads: 31K, writes: 0
+SELECT actid, tranid, val,
+  LAG(val) OVER(PARTITION BY actid ORDER BY tranid) AS prevval
+FROM dbo.TransactionsDCS;
+
+-- Query 10, when offset is different then 1, same plan as Query 6/Figure 7
+-- duration: 31 sec, CPU: 31 sec, logical reads: 31K, writes: 0
+SELECT actid, tranid, val,
+  LAG(val, 2) OVER(PARTITION BY actid ORDER BY tranid) AS prev2val
+FROM dbo.TransactionsDCS;
+
+-- Figure 10: Performance of LAG and LEAD functions
+
+---------------------------------------------------------------------
+-- FIRST_VALUE/LAST_VALUE
+---------------------------------------------------------------------
+
+-- LAST_VALUE with ROWS BETWEEN 1 PRECEDING AND 1 PRECEDING or 1 FOLLOWING AND 1 FOLLOWING optimized like LAG and LEAD.
+-- Otherwise, these functions don't use the Window Aggregate operator currently.
+-- The parts in their calculation that involve reading from a columnstore index,
+-- sorting and computing row numbers can use batch mode operators.		
+
+----------------------------------------------------------------------
+-- Runing Totals
+-- © Itzik Ben-Gan, SolidQ
+-- For more, see 5-day Advanced T-SQL Course:
+-- http://tsql.solidq.com/
+-- Upcoming deliveries in the UK: https://www.qa.com/booking?code=TPSQLADV08
+-- London, May 9, Manchester, May 16, Birmingham, May 23
+----------------------------------------------------------------------
+
+-- TSQLV3 database: http://tsql.solidq.com/SampleDatabases/TSQLV3.zip
+
+-- Sample data (or use RTBig)
+SET NOCOUNT ON;
+USE tempdb;
+
+-- Transactions table
+IF OBJECT_ID('dbo.Transactions', 'U') IS NOT NULL DROP TABLE dbo.Transactions;
+IF OBJECT_ID('dbo.Accounts', 'U') IS NOT NULL DROP TABLE dbo.Accounts;
+
+CREATE TABLE dbo.Accounts
+(
+  actid INT NOT NULL CONSTRAINT PK_Accounts PRIMARY KEY
+);
+
+CREATE TABLE dbo.Transactions
+(
+  actid  INT   NOT NULL,
+  tranid INT   NOT NULL,
+  val    MONEY NOT NULL,
+  CONSTRAINT PK_Transactions PRIMARY KEY(actid, tranid)
+);
+
+DECLARE
+  @num_partitions     AS INT = 100,
+  @rows_per_partition AS INT = 20000;
+
+INSERT INTO dbo.Accounts WITH (TABLOCK) (actid)
+  SELECT NP.n
+  FROM TSQLV3.dbo.GetNums(1, @num_partitions) AS NP;
+
+INSERT INTO dbo.Transactions WITH (TABLOCK) (actid, tranid, val)
+  SELECT NP.n, RPP.n,
+    (ABS(CHECKSUM(NEWID())%2)*2-1) * (1 + ABS(CHECKSUM(NEWID())%5))
+  FROM TSQLV3.dbo.GetNums(1, @num_partitions) AS NP
+    CROSS JOIN TSQLV3.dbo.GetNums(1, @rows_per_partition) AS RPP;
+GO
+
+----------------------------------------------------------------------
+-- Join/subquery vs. window function
+----------------------------------------------------------------------
+
+-- Without window function
+SELECT T1.actid, T1.tranid, T1.val, SUM(T2.val) AS balance
+FROM dbo.Transactions AS T1
+  INNER JOIN dbo.Transactions AS T2
+    ON T2.actid = T1.actid
+       AND T2.tranid <= T1.tranid
+GROUP BY T1.actid, T1.tranid, T1.val;
+
+-- With window function
+SELECT actid, tranid, val,
+  SUM(val) OVER(PARTITION BY actid
+                ORDER BY tranid
+                ROWS UNBOUNDED PRECEDING) AS balance
+FROM dbo.Transactions;
+
+----------------------------------------------------------------------
+-- ROWS vs. RANGE
+----------------------------------------------------------------------
+
+-- ROWS
+SELECT actid, tranid, val,
+  SUM(val) OVER(PARTITION BY actid
+                ORDER BY tranid
+                ROWS UNBOUNDED PRECEDING) AS balance
+FROM dbo.Transactions;
+
+-- RANGE
+SELECT actid, tranid, val,
+  SUM(val) OVER(PARTITION BY actid
+                ORDER BY tranid
+                RANGE UNBOUNDED PRECEDING) AS balance
+FROM dbo.Transactions;
+
+----------------------------------------------------------------------
+-- Uses of running totals to solve problems
+----------------------------------------------------------------------
+
+----------------------------------------------------------------------
+-- Regular islands
+----------------------------------------------------------------------
+
+USE TSQLV3;
+
+-- With numbers
+SET NOCOUNT ON;
+IF OBJECT_ID('dbo.T1', 'U') IS NOT NULL DROP TABLE dbo.T1;
+
+CREATE TABLE dbo.T1
+(
+  col1 INT NOT NULL
+    CONSTRAINT PK_T1 PRIMARY KEY
+);
+GO
+
+INSERT INTO dbo.T1(col1)
+  VALUES(1),(2),(3),(7),(8),(9),(11),(15),(16),(17),(28);
+
+-- When column is unique
+WITH C AS
+(
+  SELECT col1, col1 - ROW_NUMBER() OVER(ORDER BY col1) AS grp
+  FROM dbo.T1
+)
+SELECT MIN(col1) AS range_from, MAX(col1) AS range_to
+FROM C
+GROUP BY grp;
+
+-- When column isn't unique
+SET NOCOUNT ON;
+IF OBJECT_ID('dbo.T1', 'U') IS NOT NULL DROP TABLE dbo.T1;
+
+CREATE TABLE dbo.T1
+(
+  col1 INT NOT NULL
+);
+GO
+
+INSERT INTO dbo.T1(col1)
+  VALUES(1),(2),(2),(2),(3),(7),(7),(7),(8),(9),(11),(15),(16),(17),(28);
+
+-- Solution
+WITH C AS
+(
+  SELECT col1, col1 - DENSE_RANK() OVER(ORDER BY col1) AS grp
+  FROM dbo.T1
+)
+SELECT MIN(col1) AS range_from, MAX(col1) AS range_to
+FROM C
+GROUP BY grp;
+
+-- With dates
+WITH C AS
+(
+  SELECT shipperid, shippeddate,
+    DATEADD(day,
+      -1*DENSE_RANK() OVER(PARTITION BY shipperid ORDER BY shippeddate),
+      shippeddate) AS grp
+  FROM Sales.Orders
+  WHERE shippeddate IS NOT NULL
+)
+SELECT shipperid,
+  MIN(shippeddate) AS startdate, MAX(shippeddate) AS enddate,
+  COUNT(*) AS numorders
+FROM C
+GROUP BY shipperid, grp;
+
+----------------------------------------------------------------------
+-- Complex islands
+----------------------------------------------------------------------
+
+-- Thanks Paul White for running total of flag idea!
+WITH C1 AS
+(
+  SELECT orderid, shipperid, shippeddate,
+    CASE
+      WHEN DATEDIFF(day,
+        LAG(shippeddate) OVER(PARTITION BY shipperid
+                              ORDER BY shippeddate, orderid),
+        shippeddate) <= 7 THEN 0
+      ELSE 1
+    END AS isstart
+  FROM Sales.Orders
+  WHERE shippeddate IS NOT NULL
+),
+C2 AS
+(
+  SELECT orderid, shipperid, shippeddate,
+    SUM(isstart) OVER(PARTITION BY shipperid
+                      ORDER BY shippeddate, orderid
+                      ROWS UNBOUNDED PRECEDING) AS grp
+  FROM C1  
+)
+SELECT shipperid,
+  MIN(shippeddate) AS startdate, MAX(shippeddate) AS enddate,
+  COUNT(*) AS numorders
+FROM C2
+GROUP BY shipperid, grp;
+
+----------------------------------------------------------------------
+-- Last non-NULL
+----------------------------------------------------------------------
+
+-- Sample data
+SET NOCOUNT ON;
+IF OBJECT_ID(N'dbo.T1', N'U') IS NOT NULL DROP TABLE dbo.T1;
+GO
+CREATE TABLE dbo.T1
+(
+  id INT NOT NULL CONSTRAINT PK_T1 PRIMARY KEY,
+  col1 INT NULL
+);
+
+-- Small set of sample data
+TRUNCATE TABLE dbo.T1;
+
+INSERT INTO dbo.T1(id, col1) VALUES
+  ( 2, NULL),
+  ( 3,   10),
+  ( 5,   -1),
+  ( 7, NULL),
+  (11, NULL),
+  (13,  -12),
+  (17, NULL),
+  (19, NULL),
+  (23, 1759);
+GO
+
+-- Large set of sample data
+TRUNCATE TABLE dbo.T1;
+
+INSERT INTO dbo.T1 WITH(TABLOCK)
+  SELECT n AS id, CHECKSUM(NEWID()) AS col1
+  FROM TSQLV3.dbo.GetNums(1, 10000000) AS Nums
+OPTION(MAXDOP 1);
+
+-- Solution based on running aggregates
+WITH C AS
+(
+  SELECT id, col1,
+    MAX(CASE WHEN col1 IS NOT NULL THEN id END)
+      OVER(ORDER BY id
+           ROWS UNBOUNDED PRECEDING) AS grp
+  FROM dbo.T1
+)
+SELECT id, col1,
+  MAX(col1) OVER(PARTITION BY grp 
+                 ORDER BY id 
+                 ROWS UNBOUNDED PRECEDING)
+FROM C;
+
+-- Alternative
+SELECT id, col1,
+  CAST(
+    SUBSTRING(
+      MAX( CAST(id AS BINARY(4)) + CAST(col1 AS BINARY(4)) )
+        OVER( ORDER BY id
+              ROWS UNBOUNDED PRECEDING ),
+      5, 4)
+    AS INT) AS lastval
+FROM dbo.T1;
+
+----------------------------------------------------------------------
+-- Max concurrent intervals
+----------------------------------------------------------------------
+
+-- Run the following code to create and populate 
+-- the Users and Sessions tables in tempdb:
+-- Or use RTBig2
+
+SET NOCOUNT ON;
+USE tempdb;
+
+IF OBJECT_ID('dbo.Sessions') IS NOT NULL DROP TABLE dbo.Sessions;
+IF OBJECT_ID('dbo.Accounts') IS NOT NULL DROP TABLE dbo.Accounts;
+
+CREATE TABLE dbo.Accounts
+(
+  actid INT NOT NULL,
+  CONSTRAINT PK_Accounts PRIMARY KEY(actid)
+);
+GO
+
+INSERT INTO dbo.Accounts(actid) VALUES(1), (2), (3);
+
+CREATE TABLE dbo.Sessions
+(
+  sessionid INT          NOT NULL IDENTITY(1, 1),
+  actid     INT          NOT NULL,
+  starttime DATETIME2(0) NOT NULL,
+  endtime   DATETIME2(0) NOT NULL,
+  CONSTRAINT PK_Sessions PRIMARY KEY(sessionid),
+  CONSTRAINT CHK_endtime_gteq_starttime
+    CHECK (endtime >= starttime)
+);
+GO
+
+INSERT INTO dbo.Sessions(actid, starttime, endtime) VALUES
+  (1, '20151231 08:00:00', '20151231 08:30:00'),
+  (1, '20151231 08:30:00', '20151231 09:00:00'),
+  (1, '20151231 09:00:00', '20151231 09:30:00'),
+  (1, '20151231 10:00:00', '20151231 11:00:00'),
+  (1, '20151231 10:30:00', '20151231 12:00:00'),
+  (1, '20151231 11:30:00', '20151231 12:30:00'),
+  (2, '20151231 08:00:00', '20151231 10:30:00'),
+  (2, '20151231 08:30:00', '20151231 10:00:00'),
+  (2, '20151231 09:00:00', '20151231 09:30:00'),
+  (2, '20151231 11:00:00', '20151231 11:30:00'),
+  (2, '20151231 11:32:00', '20151231 12:00:00'),
+  (2, '20151231 12:04:00', '20151231 12:30:00'),
+  (3, '20151231 08:00:00', '20151231 09:00:00'),
+  (3, '20151231 08:00:00', '20151231 08:30:00'),
+  (3, '20151231 08:30:00', '20151231 09:00:00'),
+  (3, '20151231 09:30:00', '20151231 09:30:00');
+GO
+
+-- For performance testing you can use the following code,
+-- which creates a large set of sample data:
+
+-- 10,000,000 intervals
+DECLARE 
+  @num_accounts            AS INT          = 50,
+  @sessions_per_account    AS INT          = 200000,
+  @start_period            AS DATETIME2(3) = '20120101',
+  @end_period              AS DATETIME2(3) = '20160101',
+  @max_duration_in_seconds AS INT          = 3600; -- 1 hour
+  
+TRUNCATE TABLE dbo.Sessions;
+TRUNCATE TABLE dbo.Accounts;
+
+INSERT INTO dbo.Accounts(actid)
+  SELECT A.n AS actid
+  FROM TSQLV3.dbo.GetNums(1, @num_accounts) AS A;
+
+WITH C AS
+(
+  SELECT A.n AS actid,
+    DATEADD(second,
+      ABS(CHECKSUM(NEWID())) %
+        (DATEDIFF(s, @start_period, @end_period) - @max_duration_in_seconds),
+      @start_period) AS starttime
+  FROM TSQLV3.dbo.GetNums(1, @num_accounts) AS A
+    CROSS JOIN TSQLV3.dbo.GetNums(1, @sessions_per_account) AS I
+)
+INSERT INTO dbo.Sessions WITH (TABLOCK) (actid, starttime, endtime)
+  SELECT actid, starttime,
+    DATEADD(second,
+      ABS(CHECKSUM(NEWID())) % (@max_duration_in_seconds + 1),
+      starttime) AS endtime
+  FROM C;
+GO
+
+-- Indexes
+CREATE UNIQUE INDEX idx_start ON dbo.Sessions(actid, starttime, sessionid);
+CREATE UNIQUE INDEX idx_end ON dbo.Sessions(actid, endtime, sessionid);
+
+-- Solution based on running aggregate
+WITH C1 AS
+(
+  SELECT actid, starttime AS ts, +1 AS type
+  FROM dbo.Sessions
+
+  UNION ALL
+
+  SELECT actid, endtime AS ts, -1 AS type
+  FROM dbo.Sessions
+),
+C2 AS
+(
+  SELECT *,
+    SUM(type) OVER(PARTITION BY actid
+                   ORDER BY ts, type
+                   ROWS UNBOUNDED PRECEDING) AS cnt
+  FROM C1
+)
+SELECT actid, MAX(cnt) AS mx
+FROM C2
+GROUP BY actid;
+
+-- Alternative based on row numbers
+-- Thanks Ben Flanaghan!
+WITH C1 AS
+(
+  SELECT sessionid, actid, starttime AS ts, +1 AS type,
+    ROW_NUMBER() OVER(PARTITION BY actid ORDER BY starttime, sessionid) AS s
+  FROM dbo.Sessions
+
+  UNION ALL
+
+  SELECT sessionid, actid, endtime AS ts, -1 AS type,
+    NULL AS s
+  FROM dbo.Sessions
+),
+C2 AS
+(
+  SELECT *,
+    ROW_NUMBER() OVER(PARTITION BY actid ORDER BY ts, type, sessionid) AS se
+  FROM C1
+)
+SELECT actid, MAX(cnt) AS mx
+FROM C2
+  CROSS APPLY ( VALUES( s - (se - s) ) ) AS A(cnt)
+GROUP BY actid;
+
+----------------------------------------------------------------------
+-- Packing intervals
+----------------------------------------------------------------------
+
+-- Solution based on running aggregate
+WITH C1 AS
+(
+  SELECT sessionid, actid, starttime AS ts, +1 AS type
+  FROM dbo.Sessions
+
+  UNION ALL
+
+  SELECT sessionid, actid, endtime AS ts, -1 AS type
+  FROM dbo.Sessions
+),
+C2 AS
+(
+  SELECT *,
+    SUM(type) OVER(PARTITION BY actid
+                   ORDER BY ts, type DESC
+                   ROWS UNBOUNDED PRECEDING)
+      - CASE WHEN type = 1 THEN 1 ELSE 0 END AS cnt
+  FROM C1
+),
+C3 AS
+(
+  SELECT *, 
+    FLOOR((ROW_NUMBER() OVER(PARTITION BY actid ORDER BY ts) - 1) / 2 + 1) AS p
+  FROM C2
+  WHERE cnt = 0
+)
+SELECT actid, MIN(ts) AS starttime, max(ts) AS endtime
+FROM C3
+GROUP BY actid, p;
+
+-- Alternative with row numbers
+WITH C1 AS
+(
+  SELECT sessionid, actid, starttime AS ts, +1 AS type,
+    ROW_NUMBER() OVER(PARTITION BY actid ORDER BY starttime, sessionid) AS s,
+    NULL AS e
+  FROM dbo.Sessions
+
+  UNION ALL
+
+  SELECT sessionid, actid, endtime AS ts, -1 AS type,
+    NULL AS s,
+    ROW_NUMBER() OVER(PARTITION BY actid ORDER BY endtime, sessionid) AS e
+  FROM dbo.Sessions
+),
+C2 AS
+(
+  SELECT *,
+    ROW_NUMBER() OVER(PARTITION BY actid ORDER BY ts, type DESC, sessionid) AS se
+  FROM C1
+),
+C3 AS
+(
+  SELECT *,
+    FLOOR((ROW_NUMBER() OVER(PARTITION BY actid ORDER BY ts, type, sessionid) - 1) / 2 + 1) AS p
+  FROM C2
+    CROSS APPLY ( VALUES( s - (se - s) - 1, (se - e) - e ) ) AS A(cs, ce)
+  WHERE cs = 0 OR ce = 0
+)
+SELECT actid, MIN(ts) AS starttime, MAX(ts) AS endtime
+FROM C3
+GROUP BY actid, p;
+
+-- Alternative with one pass over the data and one index
+DROP INDEX idx_start on dbo.Sessions;
+DROP INDEX idx_end on dbo.Sessions;
+CREATE INDEX idx_start_end ON dbo.Sessions(actid, starttime, endtime, sessionid);
+
+-- Solution
+WITH C1 AS
+(
+  SELECT *,
+    CASE
+      -- it's already implied that cur end is on or after prev start
+      -- when cur start is on or before prev end there's intersection (not a start of an island)
+      WHEN starttime <= MAX(endtime) OVER(PARTITION BY actid
+                                          ORDER BY starttime, endtime, sessionid
+                                          ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
+        THEN 0
+      ELSE 1
+    END AS isstart
+  FROM dbo.Sessions
+),
+C2 AS
+(
+  SELECT *,
+    SUM(isstart) OVER(PARTITION BY actid
+                      ORDER BY starttime, endtime, sessionid
+                      ROWS UNBOUNDED PRECEDING) AS grp
+  FROM C1
+)
+SELECT actid, MIN(starttime) AS starttime, MAX(endtime) AS endtime
+FROM C2
+GROUP BY actid, grp;
+
+----------------------------------------------------------------------
+-- Replenishing quantities
+----------------------------------------------------------------------
+
+-- Create and populate table Transactions
+-- Or use RTBig3
+SET NOCOUNT ON;
+USE tempdb;
+
+IF OBJECT_ID(N'dbo.Transactions', N'U') IS NOT NULL DROP TABLE dbo.Transactions;
+
+CREATE TABLE dbo.Transactions
+(
+  txid INT NOT NULL PRIMARY KEY,
+  val  INT NOT NULL
+);
+GO
+
+-- Small set of sample data to check correctness
+INSERT INTO dbo.Transactions(txid, val)
+  VALUES(1,2),(2,-5),(3,4),(4,1),(5,-10),(6,3),(7,1),(8,-2),(9,1),(10,-2),(11,1),(12,-9);
+GO
+
+-- Large set of sample data
+TRUNCATE TABLE dbo.Transactions;
+
+INSERT INTO dbo.Transactions(txid, val)
+  SELECT n, SIGN(1+2*SIGN(CHECKSUM(NEWID())))*(ABS(CHECKSUM(NEWID()))%10+1) AS val
+  FROM TSQLV3.dbo.GetNums(1, 1000000) AS Nums;
+GO
+
+-- Solution
+WITH C1 AS
+(
+  SELECT *,
+    SUM(val) OVER(ORDER BY txid
+                  ROWS UNBOUNDED PRECEDING) AS runsum
+  FROM dbo.Transactions
+),
+C2 AS
+(
+  SELECT *,
+    MIN(runsum) OVER(ORDER BY txid
+                  ROWS UNBOUNDED PRECEDING) AS runmin
+  FROM C1
+)
+SELECT txid, val,
+  runsum + runreplenish AS newrunsum,
+  ISNULL(
+    runreplenish - LAG(runreplenish, 1) OVER(ORDER BY txid),
+    runreplenish) AS replenishqty
+FROM C2
+  CROSS APPLY ( VALUES( CASE WHEN runmin < 0 THEN -runmin ELSE 0 END ) ) AS A(runreplenish);
+  
+----------------------------------------------------------------------
+-- Boost your T-SQL with the APPLY Operator
+-- © Itzik Ben-Gan, SolidQ
+-- For more, see 5-day Advanced T-SQL Course:
+-- http://tsql.solidq.com/courses.htm
+----------------------------------------------------------------------
+
+SET NOCOUNT ON;
+USE TSQL2012;
+
+-- Performance database: http://tsql.solidq.com/books/source_code/Performance.txt
+-- TSQL2012 database: http://tsql.solidq.com/books/source_code/TSQL2012.zip
+
+---------------------------------------------------------------------
+-- APPLY, Described
+---------------------------------------------------------------------
+
+USE TSQL2012;
+
+-- cross join
+-- return a row for every combination of customer and year in the range 2012 - 2014
+SELECT C.custid, C.companyname, Y.n AS orderyear
+FROM Sales.Customers AS C
+  CROSS JOIN dbo.GetNums(2012, 2014) AS Y
+ORDER BY C.custid, orderyear;
+GO
+
+-- inner join
+-- return information about customers and their orders
+SELECT C.custid, C.companyname, O.orderid, O.orderdate, O.empid
+FROM Sales.Customers AS C
+  INNER JOIN Sales.Orders AS O
+    ON C.custid = O.custid;
+
+-- definition of GetTopOrders function
+IF OBJECT_ID('dbo.GetTopOrders') IS NOT NULL
+  DROP FUNCTION dbo.GetTopOrders;
+GO
+
+CREATE FUNCTION dbo.GetTopOrders(@custid AS INT, @n AS BIGINT)
+  RETURNS TABLE
+AS
+RETURN
+  SELECT TOP (@n) orderid, orderdate, empid
+  FROM Sales.Orders
+  WHERE custid = @custid
+  ORDER BY orderdate DESC, orderid DESC;
+GO
+
+SELECT * FROM dbo.GetTopOrders(1, 3) AS O;
+GO
+
+-- attempt to return the three most-recent orders for every customer
+-- using a cross join fails
+SELECT C.custid, C.companyname, O.orderid, O.orderdate, O.empid
+FROM Sales.Customers AS C
+  CROSS JOIN dbo.GetTopOrders(C.custid, 3) AS O;
+
+-- using an inner join fails
+SELECT C.custid, C.companyname, O.orderid, O.orderdate, O.empid
+FROM Sales.Customers AS C
+  INNER JOIN dbo.GetTopOrders(C.custid, 3) AS O
+--    ON ?;
+GO
+
+-- CROSS APPLY
+SELECT C.custid, C.companyname, O.orderid, O.orderdate, O.empid
+FROM Sales.Customers AS C
+  CROSS APPLY dbo.GetTopOrders(C.custid, 3) AS O;
+
+-- OUTER APPLY
+SELECT C.custid, C.companyname, O.orderid, O.orderdate, O.empid
+FROM Sales.Customers AS C
+  OUTER APPLY dbo.GetTopOrders(C.custid, 3) AS O;
+
+-- Implicit APPLY
+SELECT C.custid, C.companyname,
+  (SELECT COUNT(DISTINCT empid)
+   FROM  dbo.GetTopOrders(C.custid, 3) AS O) AS numemps
+FROM Sales.Customers AS C;
+
+---------------------------------------------------------------------
+-- 7.0 - TOP
+---------------------------------------------------------------------
+
+USE TSQL2012;
+
+-- TOP N Per Group
+
+-- create POC index
+CREATE UNIQUE INDEX idx_poc
+  ON Sales.Orders(custid, orderdate DESC, orderid DESC)
+  INCLUDE(empid);
+
+-- solution for low density
+WITH C AS
+(
+  SELECT 
+    ROW_NUMBER() OVER(
+      PARTITION BY custid
+      ORDER BY orderdate DESC, orderid DESC) AS rownum,
+    orderid, orderdate, custid, empid
+  FROM Sales.Orders
+)
+SELECT custid, orderdate, orderid, empid
+FROM C
+WHERE rownum <= 3;
+
+-- solution for high density
+SELECT C.custid, A.*
+FROM Sales.Customers AS C
+  CROSS APPLY ( SELECT TOP (3) orderid, orderdate, empid
+                FROM Sales.Orders AS O
+                WHERE O.custid = C.custid
+                ORDER BY orderdate DESC, orderid DESC    ) AS A;
+
+-- cleanup
+DROP INDEX idx_poc ON Sales.Orders;
+
+---------------------------------------------------------------------
+-- 2000 - User Defined Functions
+---------------------------------------------------------------------
+
+USE Performance;
+
+-- inline expression
+SELECT *
+FROM dbo.Orders
+WHERE orderdate = DATEADD(year, DATEDIFF(year, '19001231', orderdate), '19001231');
+
+-- scalar UDF
+IF OBJECT_ID(N'dbo.EndOfYear') IS NOT NULL
+  DROP FUNCTION dbo.EndOfYear;
+GO
+
+CREATE FUNCTION dbo.EndOfYear( @dt AS DATETIME ) RETURNS DATETIME
+AS
+BEGIN
+  RETURN DATEADD(year, DATEDIFF(year, '19001231', @dt), '19001231')
+END;
+GO
+
+SELECT *
+FROM dbo.Orders
+WHERE orderdate = dbo.EndOfYear(orderdate);
+GO
+
+-- inline UDF
+IF OBJECT_ID(N'dbo.EndOfYear') IS NOT NULL
+  DROP FUNCTION dbo.EndOfYear;
+GO
+
+CREATE FUNCTION dbo.EndOfYear( @dt AS DATETIME ) RETURNS TABLE
+AS
+RETURN SELECT DATEADD(year, DATEDIFF(year, '19001231', @dt), '19001231') AS eoy
+GO
+
+SELECT O.*
+FROM dbo.Orders AS O
+  CROSS APPLY dbo.EndOfYear( O.orderdate ) AS A
+WHERE O.orderdate = A.eoy;
+
+---------------------------------------------------------------------
+-- 2005 - Partitioning
+---------------------------------------------------------------------
+
+-- Aggregates Over Partitioned Tables
+
+-- Creating Sample Data
+
+-- Create sample database TestMinMax
+SET NOCOUNT ON;
+USE master;
+IF DB_ID('TestMinMax') IS NOT NULL
+  DROP DATABASE TestMinMax;
+CREATE DATABASE TestMinMax
+GO
+USE TestMinMax;
+GO
+
+-- Create and populate partitioned table T1
+CREATE PARTITION FUNCTION PF1 (INT)
+AS RANGE LEFT FOR VALUES (200000, 400000, 600000, 800000);
+
+CREATE PARTITION SCHEME PS1
+AS PARTITION PF1 ALL TO ([PRIMARY]);
+
+CREATE TABLE dbo.T1
+(
+  col1 INT NOT NULL,
+  col2 INT NOT NULL,
+  filler BINARY(200) NOT NULL DEFAULT(0x01)
+) ON PS1(col1);
+
+CREATE UNIQUE CLUSTERED INDEX idx_col1 ON dbo.T1(col1) ON PS1(col1);
+CREATE NONCLUSTERED INDEX idx_col2 ON dbo.T1(col2) ON PS1(col1);
+
+INSERT INTO dbo.T1 WITH (TABLOCK) (col1, col2)
+  SELECT n, CHECKSUM(NEWID()) FROM TSQL2012.dbo.GetNums(1, 1000000);
+GO
+
+-- Query 1
+-- Efficient because applying aggregate to partitioning column
+SELECT MAX(col1) AS mx
+FROM dbo.T1;
+
+-- Query 2
+-- Inefficient because applying aggregate to nonpartitioning column
+-- even though index exists on col2 due to optimization bug
+SELECT MAX(col2) AS mx
+FROM dbo.T1;
+
+-- Query 3
+-- Example showing efficient index use with one partition
+SELECT MAX(col2) AS pmx
+FROM dbo.T1
+WHERE $PARTITION.PF1(col1) = 1;
+
+-- Query 4
+-- Workaround to original need MAX(col2) with dynamic querying of partitions in table
+SELECT MAX(A.pmx) AS mx
+FROM sys.partitions AS P
+  CROSS APPLY ( SELECT MAX(T1.col2) AS pmx
+                FROM dbo.T1
+                WHERE $PARTITION.PF1(T1.col1) = P.partition_number ) AS A
+WHERE P.object_id = OBJECT_ID('dbo.T1')
+  AND P.index_id = INDEXPROPERTY( OBJECT_ID('dbo.T1'), 'idx_col2', 'IndexID' );
+
+-- Improving Parallelism
+
+USE Performance;
+CREATE INDEX idx1 ON dbo.Orders(empid) INCLUDE(orderid);
+
+-- Slow
+SELECT empid, orderid,
+  ROW_NUMBER() OVER(PARTITION BY empid
+                    ORDER BY orderid) AS rownum1_asc,
+  ROW_NUMBER() OVER(PARTITION BY empid 
+                    ORDER BY orderid DESC) AS rownum1_desc
+FROM dbo.Orders;
+
+-- with APPLY
+SELECT A.*
+FROM dbo.Employees AS E
+  CROSS APPLY
+    (SELECT empid, orderid,
+       ROW_NUMBER() OVER(ORDER BY orderid) AS rownum1_asc,
+       ROW_NUMBER() OVER(ORDER BY orderid DESC) AS rownum1_desc
+     FROM dbo.Orders AS O
+     WHERE O.empid = E.empid) AS A
+OPTION(QUERYTRACEON 8649);
+
+-- cleanup
+DROP INDEX idx1 ON dbo.Orders;
+
+---------------------------------------------------------------------
+-- 2008 - VALUES
+---------------------------------------------------------------------
+
+USE TSQL2012;
+
+-- Reuse of Column Aliases
+SELECT
+  start_of_week,
+  DATEADD(day, 6, start_of_week) AS end_of_week,
+  SUM(val) AS total_val,
+  COUNT(*) AS num_orders
+FROM Sales.OrderValues
+  CROSS APPLY (VALUES(DATEPART(weekday, orderdate) - 1)) AS A1(dist)
+  CROSS APPLY (VALUES(DATEADD(day, -dist, orderdate))) AS A2(start_of_week)
+GROUP BY start_of_week;
+
+-- Unpivoting Multiple Sets of Columns
+
+-- Code to Create and Populate the Sales Table
+USE tempdb;
+IF OBJECT_ID('dbo.Sales', 'U') IS NOT NULL DROP TABLE dbo.Sales;
+GO
+
+CREATE TABLE dbo.Sales
+(
+  custid    VARCHAR(10) NOT NULL,
+  qty2012   INT   NULL,
+  qty2013   INT   NULL,
+  qty2014   INT   NULL,
+  val2012   MONEY NULL,
+  val2013   MONEY NULL,
+  val2014   MONEY NULL,
+  CONSTRAINT PK_Sales PRIMARY KEY(custid)
+);
+
+INSERT INTO dbo.Sales
+    (custid, qty2012, qty2013, qty2014, val2012, val2013, val2014)
+  VALUES
+    ('A', 606,113,781,4632.00,6877.00,4815.00),
+    ('B', 243,861,637,2125.00,8413.00,4476.00),
+    ('C', 932,117,202,9068.00,342.00,9083.00),
+    ('D', 915,833,138,1131.00,9923.00,4164.00),
+    ('E', 822,246,870,1907.00,3860.00,7399.00);
+
+-- Solution with APPLY
+SELECT custid, salesyear, qty, val
+FROM dbo.Sales
+  CROSS APPLY 
+    ( VALUES(2012, qty2012, val2012),
+            (2013, qty2013, val2013),
+            (2014, qty2014, val2014) ) AS A(salesyear, qty, val);
+
+-- Aggregate Over Columns
+
+-- Code to Create and Populate the Sales Table
+USE tempdb;
+IF OBJECT_ID('dbo.Sales', 'U') IS NOT NULL DROP TABLE dbo.Sales;
+GO
+
+CREATE TABLE dbo.Sales
+(
+  custid    VARCHAR(10) NOT NULL,
+  salesyear INT NOT NULL,
+  [01]      INT NULL,
+  [02]      INT NULL,
+  [03]      INT NULL,
+  [04]      INT NULL,
+  [05]      INT NULL,
+  [06]      INT NULL,
+  [07]      INT NULL,
+  [08]      INT NULL,
+  [09]      INT NULL,
+  [10]      INT NULL,
+  [11]      INT NULL,
+  [12]      INT NULL,
+  CONSTRAINT PK_Sales PRIMARY KEY(custid, salesyear)
+);
+
+INSERT INTO dbo.Sales
+    (custid, salesyear, [01],[02],[03],[04],[05],[06],[07],[08],[09],[10],[11],[12])
+  VALUES
+    ('A', 2013, 90,41,75,9,85,6,65,5,30,90,11,71),
+    ('A', 2014, 29,29,8,95,1,16,36,74,59,43,31,49),
+    ('B', 2012, 29,51,92,15,2,45,26,90,34,14,25,9),
+    ('B', 2013, 39,8,94,25,30,35,42,75,62,7,98,19),
+    ('B', 2014, 39,22,41,56,5,27,2,22,32,52,74,26);
+
+-- Solution with APPLY
+SELECT *
+FROM dbo.Sales
+  CROSS APPLY
+    (SELECT MIN(qty) AS mn, MAX(qty) AS mx
+     FROM (VALUES([01]),([02]),([03]),
+                 ([04]),([05]),([06]),
+                 ([07]),([08]),([09]),
+                 ([10]),([11]),([12])) AS D(qty)) AS A;
+
+---------------------------------------------------------------------
+-- 2012 - OFFSET-FETCH
+---------------------------------------------------------------------
+
+-- Median
+
+USE TSQL2012;
+
+-- Small set of sample data
+IF OBJECT_ID('dbo.T1', 'U') IS NOT NULL DROP TABLE dbo.T1;
+GO
+
+CREATE TABLE dbo.T1
+(
+  id  INT NOT NULL IDENTITY
+    CONSTRAINT PK_T1 PRIMARY KEY,
+  grp INT NOT NULL,
+  val INT NOT NULL
+);
+
+CREATE INDEX idx_grp_val ON dbo.T1(grp, val);
+
+INSERT INTO dbo.T1(grp, val)
+  VALUES(1, 30),(1, 10),(1, 100),
+        (2, 65),(2, 60),(2, 65),(2, 10);
+GO
+
+-- Large set of sample data
+DECLARE
+  @numgroups AS INT = 10,
+  @rowspergroup AS INT = 1000000;
+
+TRUNCATE TABLE dbo.T1;
+
+DROP INDEX idx_grp_val ON dbo.T1;
+
+INSERT INTO dbo.T1 WITH(TABLOCK) (grp, val)
+  SELECT G.n, ABS(CHECKSUM(NEWID())) % 101
+  FROM dbo.GetNums(1, @numgroups) AS G
+    CROSS JOIN dbo.GetNums(1, @rowspergroup) AS R;
+
+CREATE INDEX idx_grp_val ON dbo.T1(grp, val);
+
+-- Solution Using PERCENTILE_CONT
+SELECT DISTINCT grp,
+  PERCENTILE_CONT(0.5) WITHIN GROUP(ORDER BY val)
+    OVER(PARTITION BY grp) AS median
+FROM dbo.T1;
+
+-- Solution Using APPLY and OFFSET-FETCH
+WITH C AS
+(
+  SELECT grp,
+    COUNT(*) AS cnt,
+    (COUNT(*) - 1) / 2 AS offset_val,
+    2 - COUNT(*) % 2 AS fetch_val
+  FROM dbo.T1
+  GROUP BY grp
+)
+SELECT grp, AVG(1. * val) AS median
+FROM C
+  CROSS APPLY ( SELECT O.val
+                FROM dbo.T1 AS O
+                where O.grp = C.grp
+                order by O.val
+                OFFSET C.offset_val ROWS FETCH NEXT C.fetch_val ROWS ONLY ) AS A
+GROUP BY grp;
+
+-- Reducing Lookups
+USE Performance;
+GO
+
+DECLARE @pagenum AS BIGINT = 3, @pagesize AS BIGINT = 25;
+
+SELECT orderid, orderdate, custid, empid
+FROM dbo.Orders
+ORDER BY orderid
+OFFSET (@pagenum - 1) * @pagesize ROWS FETCH NEXT @pagesize ROWS ONLY;
+GO
+
+DECLARE @pagenum AS BIGINT = 20000, @pagesize AS BIGINT = 25;
+
+SELECT orderid, orderdate, custid, empid
+FROM dbo.Orders
+ORDER BY orderid
+OFFSET (@pagenum - 1) * @pagesize ROWS FETCH NEXT @pagesize ROWS ONLY;
+GO
+
+DECLARE @pagenum AS BIGINT = 20000, @pagesize AS BIGINT = 25;
+
+WITH C AS
+(
+  SELECT orderid, orderdate
+  FROM dbo.Orders
+  ORDER BY orderid
+  OFFSET (@pagenum - 1) * @pagesize ROWS FETCH NEXT @pagesize ROWS ONLY
+)
+SELECT C.*, A.*
+FROM C CROSS APPLY (SELECT custid, empid
+                    FROM dbo.Orders AS O
+                    WHERE O.orderid = C.orderid) AS A;
+GO  
+
+---------------------------------------------------------------------
+-- T-SQL Black-Belt Column February, 2012
+-- Window Functions - Part III
+---------------------------------------------------------------------
+
+---------------------------------------------------------------------
+-- Sample Data
+---------------------------------------------------------------------
+
+-- Listing 1: Definition of GetNums Helper Function
+USE tempdb;
+IF OBJECT_ID('dbo.GetNums', 'IF') IS NOT NULL DROP FUNCTION dbo.GetNums;
+GO
+CREATE FUNCTION dbo.GetNums(@low AS BIGINT, @high AS BIGINT) RETURNS TABLE
+AS
+RETURN
+  WITH
+    L0   AS (SELECT c FROM (VALUES(1),(1)) AS D(c)),
+    L1   AS (SELECT 1 AS c FROM L0 AS A CROSS JOIN L0 AS B),
+    L2   AS (SELECT 1 AS c FROM L1 AS A CROSS JOIN L1 AS B),
+    L3   AS (SELECT 1 AS c FROM L2 AS A CROSS JOIN L2 AS B),
+    L4   AS (SELECT 1 AS c FROM L3 AS A CROSS JOIN L3 AS B),
+    L5   AS (SELECT 1 AS c FROM L4 AS A CROSS JOIN L4 AS B),
+    Nums AS (SELECT ROW_NUMBER() OVER(ORDER BY (SELECT NULL)) AS rownum
+            FROM L5)
+  SELECT @low + rownum - 1 AS n
+  FROM Nums
+  ORDER BY rownum
+  OFFSET 0 ROWS FETCH FIRST @high - @low + 1 ROWS ONLY;
+GO
+
+-- Listing 2: Code to Generate Sample Data
+-- create tables
+SET NOCOUNT ON;
+USE tempdb;
+IF OBJECT_ID('dbo.Transactions', 'U') IS NOT NULL DROP TABLE dbo.Transactions;
+IF OBJECT_ID('dbo.Accounts', 'U') IS NOT NULL DROP TABLE dbo.Accounts;
+GO
+CREATE TABLE dbo.Accounts
+(
+  actid   INT         NOT NULL,
+  actname VARCHAR(50) NOT NULL,
+  CONSTRAINT PK_Accounts PRIMARY KEY(actid)
+);
+
+CREATE TABLE dbo.Transactions
+(
+  actid  INT   NOT NULL,
+  tranid INT   NOT NULL,
+  val    MONEY NOT NULL,
+  CONSTRAINT PK_Transactions PRIMARY KEY(actid, tranid),
+  CONSTRAINT FK_Transactions_Accounts
+    FOREIGN KEY(actid)
+    REFERENCES dbo.Accounts(actid)
+);
+GO
+
+-- populate tables
+DECLARE
+  @num_partitions     AS INT = 100,
+  @rows_per_partition AS INT = 20000;
+
+TRUNCATE TABLE dbo.Transactions;
+DELETE FROM dbo.Accounts;
+
+INSERT INTO dbo.Accounts WITH (TABLOCK) (actid, actname)
+  SELECT n AS actid, 'account ' + CAST(n AS VARCHAR(10)) AS actname
+  FROM dbo.GetNums(1, @num_partitions) AS P;
+
+INSERT INTO dbo.Transactions WITH (TABLOCK) (actid, tranid, val)
+  SELECT NP.n, RPP.n,
+    (ABS(CHECKSUM(NEWID())%2)*2-1) * (1 + ABS(CHECKSUM(NEWID())%5))
+  FROM dbo.GetNums(1, @num_partitions) AS NP
+    CROSS JOIN dbo.GetNums(1, @rows_per_partition) AS RPP;
+GO
+
+---------------------------------------------------------------------
+-- Indexing Guidelines
+---------------------------------------------------------------------
+
+-- with POC index
+SELECT actid, tranid, val,
+  SUM(val) OVER(PARTITION BY actid
+                ORDER BY tranid
+                ROWS UNBOUNDED PRECEDING) AS runval
+FROM dbo.Transactions;
+
+-- without POC index - plan requires a Sort iterator
+SELECT actid, tranid, val,
+  SUM(val) OVER(PARTITION BY actid
+                ORDER BY val
+                ROWS UNBOUNDED PRECEDING) AS runval
+FROM dbo.Transactions;
+
+---------------------------------------------------------------------
+-- Fast Track
+---------------------------------------------------------------------
+
+-- when using UNBOUNDED PRECEDING
+SELECT actid, tranid, val,
+  SUM(val) OVER(PARTITION BY actid
+                ORDER BY tranid
+                ROWS UNBOUNDED PRECEDING) AS runval
+FROM dbo.Transactions;
+
+---------------------------------------------------------------------
+-- Compute Two Cumulative Values
+---------------------------------------------------------------------
+
+-- function is cumulative, e.g., SUM, COUNT, frame > 4 rows
+SELECT actid, tranid, val,
+  AVG(val) OVER(PARTITION BY actid
+                ORDER BY tranid
+                ROWS BETWEEN 24 PRECEDING
+                         AND CURRENT ROW) AS avgval
+FROM dbo.Transactions;
+
+---------------------------------------------------------------------
+-- Expanding all Frame Rows
+---------------------------------------------------------------------
+
+-- when frame <= 4 rows
+SELECT actid, tranid, val,
+  AVG(val) OVER(PARTITION BY actid
+                ORDER BY tranid
+                ROWS BETWEEN 3 PRECEDING
+                         AND CURRENT ROW) AS avgval
+FROM dbo.Transactions;
+
+-- when function isn’t cumulative, e.g., MIN, MAX
+SELECT actid, tranid, val,
+  MAX(val) OVER(PARTITION BY actid
+                ORDER BY tranid
+                ROWS BETWEEN 24 PRECEDING
+                         AND CURRENT ROW) AS maxval
+FROM dbo.Transactions;
+
+---------------------------------------------------------------------
+-- In-Memory vs. On-Disk Spool
+---------------------------------------------------------------------
+
+-- Listing 3: Listing 3: Defining Extended Event for Use of On-Disk Spool
+CREATE EVENT SESSION xe_window_spool ON SERVER
+ADD EVENT sqlserver.window_spool_ondisk_warning
+  ( ACTION (sqlserver.plan_handle, sqlserver.sql_text) )
+ADD TARGET package0.asynchronous_file_target
+  ( SET FILENAME  = N'c:\temp\xe_xe_window_spool.xel', 
+    metadatafile  = N'c:\temp\xe_xe_window_spool.xem' );
+
+ALTER EVENT SESSION xe_window_spool ON SERVER STATE = START;
+
+-- get IO info
+SET STATISTICS IO ON;
+
+-- in-memory spool (frame <= 10000 rows)
+SELECT actid, tranid, val,
+  MAX(val) OVER(PARTITION BY actid
+                ORDER BY tranid
+                ROWS BETWEEN 9999 PRECEDING
+                         AND 9999 PRECEDING) AS maxval
+FROM dbo.Transactions;
+
+-- on-disk spool (frame > 10000 rows)
+SELECT actid, tranid, val,
+  MAX(val) OVER(PARTITION BY actid
+                ORDER BY tranid
+                ROWS BETWEEN 10000 PRECEDING
+                         AND 10000 PRECEDING) AS maxval
+FROM dbo.Transactions;
+
+-- on-disk spool (use of RANGE--implied by default)
+SELECT actid, tranid, val,
+  SUM(val) OVER(PARTITION BY actid
+                ORDER BY tranid) AS runval
+FROM dbo.Transactions;
+
+-- cleanup
+DROP EVENT SESSION xe_window_spool ON SERVER;
+
+
+
+/*****************************************************************************
+Copyright (c) 2017 SQL Workbooks LLC
+Terms of Use: https://sqlworkbooks.com/terms-of-service/
+Contact: help@sqlworkbooks.com
+
+Setup:
+    Download BabbyNames.bak.zip (11.6 MB database backup)
+    https://github.com/LitKnd/BabbyNames/releases/tag/v1.0
+
+Then review and run the script below on a SQL Server 2016 dedicated test instance
+    Developer Edition recommended (Enteprise and Evaluation Editions will work too)
+
+The script
+    Restores the database (edit the file locations for your instance)
+    Expands and modifies the data
+        30GB data file
+        3GB log file
+    Duration on my test instance (4 vCPUs, SSDs): ~15 minutes    
+
+*****************************************************************************/
+
+
+
+/****************************************************
+Restore database
+****************************************************/
+use master;
+GO
+
+IF DB_ID('BabbyNames') IS NOT NULL
+BEGIN
+    ALTER DATABASE BabbyNames
+        SET SINGLE_USER
+        WITH ROLLBACK IMMEDIATE;
+END
+GO
+
+RESTORE DATABASE BabbyNames
+    FROM DISK=N'S:\MSSQL\Backup\BabbyNames.bak'
+    WITH
+        MOVE 'BabbyNames' TO 'S:\MSSQL\Data\BabbyNames.mdf',
+        MOVE 'BabbyNames_log' TO 'S:\MSSQL\Data\BabbyNames_log.ldf',
+        REPLACE,
+        RECOVERY;
+GO
+
+/* Once you've executed the script once, consider making a backup
+to avoid having to do it again */
+
+
+--BACKUP DATABASE BabbyNames
+--    TO DISK=N'S:\MSSQL\Backup\BabbyNames_Filter.bak' WITH INIT, COMPRESSION, STATS=5;
+--GO
+
+/* If you've done that step, restore from the "cheater" copy instead of running the whole script.
+You may want to run the query at the end of the script a couple of times still, for demo purposes */
+
+--use master;
+--GO
+--IF DB_ID('BabbyNames') IS NOT NULL
+--BEGIN
+--    ALTER DATABASE BabbyNames
+--        SET SINGLE_USER
+--        WITH ROLLBACK IMMEDIATE;
+--END
+--GO
+--RESTORE DATABASE BabbyNames
+--    FROM DISK=N'S:\MSSQL\Backup\BabbyNames_Filter.bak'
+--    WITH
+--        MOVE 'BabbyNames' TO 'S:\MSSQL\Data\BabbyNames.mdf',
+--        MOVE 'BabbyNames_log' TO 'S:\MSSQL\Data\BabbyNames_log.ldf',
+--        REPLACE,
+--        RECOVERY;
+--GO
+
+ALTER DATABASE BabbyNames SET RECOVERY SIMPLE;
+GO
+
+/* This script expands the data a couple of times. */
+ALTER DATABASE BabbyNames MODIFY FILE (NAME='BabbyNames', SIZE=30GB, FILEGROWTH=512MB);
+GO
+
+ALTER DATABASE BabbyNames MODIFY FILE (NAME='BabbyNames_log', SIZE=3GB, FILEGROWTH=512MB);
+GO
+
+ALTER DATABASE BabbyNames ADD FILEGROUP BabbyNames_mod CONTAINS MEMORY_OPTIMIZED_DATA;
+GO
+
+ALTER DATABASE BabbyNames 
+    ADD FILE( NAME = 'BabbyNames_mod' , FILENAME = 'S:\MSSQL\Data\BabbyNames_mod') 
+    TO FILEGROUP BabbyNames_mod;  
+GO  
+
+
+/****************************************************
+Configure database and expand data
+****************************************************/
+
+SET STATISTICS IO, TIME OFF;
+GO
+SET XACT_ABORT, NOCOUNT, ANSI_NULLS, QUOTED_IDENTIFIER, ANSI_PADDING ON;
+GO
+
+ALTER DATABASE [BabbyNames] SET QUERY_STORE = ON
+GO
+ALTER DATABASE [BabbyNames] SET QUERY_STORE 
+    (OPERATION_MODE = READ_WRITE, 
+    CLEANUP_POLICY = (STALE_QUERY_THRESHOLD_DAYS = 180), MAX_STORAGE_SIZE_MB = 1024
+    )
+GO
+
+
+/* SQL Server 2014+ */
+ALTER DATABASE BabbyNames SET COMPATIBILITY_LEVEL=130;
+GO
+
+/* SQL Server 2012+ */
+ALTER DATABASE BabbyNames SET TARGET_RECOVERY_TIME = 60 SECONDS;
+GO
+
+USE BabbyNames;
+GO
+
+EXEC evt.logme N'Restored small BabbyNames database';
+GO
+
+/* SQL Server 2016+ */
+ALTER DATABASE SCOPED CONFIGURATION SET QUERY_OPTIMIZER_HOTFIXES = OFF;
+GO
+
+ALTER DATABASE SCOPED CONFIGURATION SET LEGACY_CARDINALITY_ESTIMATION = OFF;
+GO
+
+exec sp_configure 'show advanced options', 1;
+GO
+RECONFIGURE
+GO
+
+exec sp_configure 'max degree of parallelism', 4;
+GO
+
+RECONFIGURE
+GO
+
+
+/******************************************************/
+/* ref.Numbers                                        */
+/******************************************************/
+
+/* Create ref.Numbers. This is a helper "numbers" table just to help us in the next step.*/
+IF SCHEMA_ID('ref') IS NULL
+BEGIN
+    EXEC evt.logme N'Create schema ref.';
+
+    EXEC ('CREATE SCHEMA ref AUTHORIZATION dbo');
+END
+GO
+
+EXEC evt.logme N'Create ref.Numbers.';
+GO
+IF OBJECT_ID('ref.Numbers','U') IS NOT NULL
+BEGIN
+    EXEC evt.logme N'Table ref.Numbers already exists, dropping.';
+
+    DROP TABLE ref.Numbers;
+END
+GO
+
+CREATE TABLE ref.Numbers (
+    Num INT NOT NULL,
+);
+GO
+
+EXEC evt.logme N'Load ref.Numbers.';
+GO
+INSERT ref.Numbers
+    (Num)
+SELECT TOP 10000000
+    ROW_NUMBER() OVER (ORDER BY fn1.ReportYear)
+FROM agg.FirstNameByYear AS fn1
+CROSS JOIN agg.FirstNameByYear AS fn2;
+GO
+
+EXEC evt.logme N'Key ref.Numbers.';
+GO
+ALTER TABLE ref.Numbers
+    ADD CONSTRAINT pk_refNumbers_Num
+        PRIMARY KEY CLUSTERED (Num);
+GO
+
+
+
+
+/******************************************************/
+/* Helper index                                       */
+/******************************************************/
+
+EXEC evt.logme N'Create nccx_halp ON agg.FirstNameByYear.';
+GO
+
+CREATE NONCLUSTERED COLUMNSTORE INDEX nccx_halp on agg.FirstNameByYear 
+    (FirstNameId, ReportYear, NameCount, Gender)
+GO
+
+
+
+/******************************************************/
+/* Create and load dbo.FirstNameByBirthDate           */
+/******************************************************/
+
+EXEC evt.logme N'Load dbo.FirstNameByBirthDate_stage.';
+GO
+
+/* This select into gets parallel insert plan, 20170906 */
+SELECT
+    ISNULL(CAST(ROW_NUMBER() OVER (ORDER BY (SELECT 1)) AS bigint),0) AS FirstNameByBirthDateId,
+    DATEADD(mi,n.Num * 5.1,CAST('1/1/' + CAST(ReportYear AS CHAR(4)) AS datetime2)) as FakeBirthDateStamp,
+    fn.FirstNameId,
+    Gender,
+    NULL as Flag
+INTO dbo.FirstNameByBirthDate_stage
+FROM agg.FirstNameByYear AS fn
+CROSS APPLY (select Num from ref.Numbers where Num <= fn.NameCount) AS n
+    OPTION (RECOMPILE);
+GO
+
+EXEC evt.logme N'Create dbo.FirstNameByBirthDate, which has an identity property and a persisted computed column';
+GO
+
+CREATE TABLE dbo.FirstNameByBirthDate (
+    FirstNameByBirthDateId BIGINT IDENTITY(1,1),
+    FakeBirthDateStamp DATETIME2,
+    BirthYear AS YEAR(FakeBirthDateStamp),
+    FirstNameId INT NOT NULL,
+    Gender CHAR(1) NOT NULL,
+    Flag TINYINT NULL
+)
+GO
+
+EXEC evt.logme N'Move data to the table with the identity and peristed computed column';
+GO
+
+/* Avoiding ALTER TABLE to add persisted computed col due to logging overhead for size of data operation, 20170906 */
+SET IDENTITY_INSERT dbo.FirstNameByBirthDate ON;
+GO
+
+INSERT dbo.FirstNameByBirthDate WITH (TABLOCK) 
+    (FirstNameByBirthDateId, FakeBirthDateStamp, FirstNameId, Gender, Flag) 
+SELECT FirstNameByBirthDateId, FakeBirthDateStamp, FirstNameId, Gender, Flag
+FROM dbo.FirstNameByBirthDate_stage;
+GO
+
+SET IDENTITY_INSERT dbo.FirstNameByBirthDate OFF;
+GO
+
+DROP TABLE FirstNameByBirthDate_stage;
+GO
+
+EXEC evt.logme N'Create clustered PK on dbo.FirstNameByBirthDate';
+GO
+
+ALTER TABLE dbo.FirstNameByBirthDate
+    ADD CONSTRAINT pk_FirstNameByBirthDate_FirstNameByBirthDateId
+        PRIMARY KEY CLUSTERED (FirstNameByBirthDateId)
+    WITH (DATA_COMPRESSION = ROW);
+GO
+
+EXEC evt.logme N'Clean up nccx_halp ON agg.FirstNameByYear.';
+GO
+DROP INDEX IF EXISTS nccx_halp ON agg.FirstNameByYear;
+GO
+
+
+/******************************************************/
+/* Foreign key constraint                             */
+/******************************************************/
+
+EXEC evt.logme N'Create FK FK_FirstNameByBirthDate_FirstNameId';
+GO
+
+ALTER TABLE dbo.FirstNameByBirthDate WITH CHECK  
+ADD CONSTRAINT FK_FirstNameByBirthDate_FirstNameId FOREIGN KEY (FirstNameId) 
+    REFERENCES ref.FirstName (FirstNameId);
+GO
+
+
+EXEC evt.logme N'"Flag" a few rows';
+GO
+
+UPDATE dbo.FirstNameByBirthDate
+    SET Flag = 1
+WHERE FirstNameId IN (58836, 84282)
+GO
+
+
+EXEC evt.logme N'Create a non-filtered NC index';
+GO
+
+CREATE INDEX ix_FirstNameByBirthDate_Flag_INCLUDES
+    on dbo.FirstNameByBirthDate
+    (Flag)
+    INCLUDE (FirstNameByBirthDateId, FakeBirthDateStamp, FirstNameId, Gender)
+    WITH (DATA_COMPRESSION = ROW);
+GO
+
+
+/******************************************************/
+/* We're all done                                     */
+/******************************************************/
+EXEC evt.logme N'BEEP BOOP WE ARE DONE';
+GO
+
